@@ -4,7 +4,7 @@ A confidential OpenID Connect relying party for a traditional Rust application, 
 
 `signals` defaults to on. `signals: false` turns CAEP and RISC off: the receiver does not start, transmitter metadata is not required, and the authorization request does not include `ssf.read` or `ssf.manage`. `DEFAULT_SCOPES` still names those two scopes. They are removed after that default is applied. The shipped demo omits `signals`, so they stay on.
 
-The license is the MIT License in `LICENSE`. Publishing is not set up. `develop` and `main` are the branches the test workflow runs.
+The license is the MIT License in `LICENSE`. A pull request merged into `main` publishes the crate to crates.io after the test workflow succeeds on that commit. A direct push does not. The token is the `CARGO_REGISTRY_TOKEN` repository secret. A version already on crates.io stays there; the next release is a new `version` in `Cargo.toml`. `develop` and `main` are the branches the test workflow runs.
 
 Rust edition 2021. RSA signatures use the `rsa` crate. PSS, ECDSA, and EdDSA are not implemented.
 

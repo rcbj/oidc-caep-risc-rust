@@ -3,8 +3,14 @@ name = "oidc-caep-risc"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-publish = false
+authors = ["rcbjBlueMars <9321971+rcbjBlueMars@users.noreply.github.com>"]
 description = "Confidential OpenID Connect relying party and one CAEP/RISC poll stream"
+repository = "https://github.com/rcbj/oidc-caep-risc-rust"
+homepage = "https://github.com/rcbj/oidc-caep-risc-rust"
+documentation = "https://docs.rs/oidc-caep-risc"
+readme = "README.md"
+keywords = ["oidc", "openid", "oauth2", "caep", "risc"]
+categories = ["authentication"]
 
 [dependencies]
 base64 = "0.22"
