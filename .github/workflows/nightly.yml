@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
+# SPDX-License-Identifier: MIT
+name: Nightly
+
+on:
+  schedule:
+    # 07:02 UTC is this library's slot in the 06:00–07:58 window.
+    - cron: '2 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit suite
+        run: docker build --target test .
+      - name: Live iya-sts
+        run: python3 scripts/live_iya_sts.py
