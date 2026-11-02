@@ -1,0 +1,24 @@
+[package]
+name = "oidc-caep-risc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Confidential OpenID Connect relying party and one CAEP/RISC poll stream"
+
+[dependencies]
+base64 = "0.22"
+hmac = "0.12"
+native-tls = "0.2"
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+signature = "2"
+tiny_http = "0.12"
+ureq = { version = "2.12", default-features = false, features = ["tls", "native-tls"] }
+url = "2"
+
+[[bin]]
+name = "demo"
+path = "demo/main.rs"

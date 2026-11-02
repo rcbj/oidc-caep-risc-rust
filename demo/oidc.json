@@ -1,0 +1,14 @@
+{
+  "metadataUrl": "https://localhost:8081/.well-known/openid-configuration",
+  "client_id": "oidc-caep-risc-demo",
+  "clientSecret": "file:generated/client-secret",
+  "redirectUri": "http://localhost:3000/callback",
+  "postLogoutRedirectUri": "http://localhost:3000/",
+  "scopes": "openid profile email offline_access ssf.read ssf.manage",
+  "tokenEndpointAuthMethod": "client_secret_basic",
+  "tlsCa": "generated/idp-ca.pem",
+  "ssf": {
+    "transmitter": "https://localhost:8081",
+    "pollIntervalMs": 3000
+  }
+}

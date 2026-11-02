@@ -1,0 +1,62 @@
+/* SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
+   SPDX-License-Identifier: MIT */
+:root {
+  --bg: #f7f7f5;
+  --fg: #1d2125;
+  --muted: #5d656d;
+  --line: #d9dcdf;
+  --accent: #2a5db0;
+  --problem: #9b1c1c;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #16191c; --fg: #e6e8ea; --muted: #a2a9b0; --line: #343a40; --accent: #7aa7f0; --problem: #f19a9a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+header, main, footer { max-width: 52rem; margin: 0 auto; padding: 1rem; }
+header { border-bottom: 1px solid var(--line); }
+header a { color: var(--fg); font-weight: 600; text-decoration: none; }
+footer { color: var(--muted); font-size: 0.875rem; border-top: 1px solid var(--line); margin-top: 2rem; }
+a { color: var(--accent); }
+h1 { font-size: 1.6rem; }
+.buttons { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.button, button { display: inline-block; padding: 0.55rem 0.9rem; border: 1px solid var(--accent); border-radius: 6px;
+  color: var(--accent); background: transparent; font: inherit; text-decoration: none; cursor: pointer; }
+.button.primary, button { background: var(--accent); color: var(--bg); }
+.problem { color: var(--problem); border-left: 3px solid var(--problem); padding-left: 0.75rem; overflow-wrap: anywhere; }
+table.facts { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1.5rem; }
+table.facts th, table.facts td { text-align: left; vertical-align: top; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+table.facts th { width: 13rem; font-weight: 600; }
+small { color: var(--muted); }
+.page-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--line); margin: 1rem 0; }
+.page-tab { padding: 0.5rem 0.9rem; color: var(--muted); text-decoration: none; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; margin-bottom: -1px; }
+.page-tab[aria-selected="true"] { color: var(--fg); border-color: var(--line); background: var(--bg); font-weight: 600; }
+.card { border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 1rem 1rem; margin: 0 0 1rem; }
+.notice { border-left: 3px solid var(--accent); padding-left: 0.75rem; }
+.badge { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 0.05rem 0.4rem; border-radius: 4px; border: 1px solid var(--line); }
+.badge.caep { color: #1f6f43; border-color: #1f6f43; }
+.badge.risc { color: #8a3b12; border-color: #8a3b12; }
+.badge.ssf { color: var(--muted); }
+@media (prefers-color-scheme: dark) { .badge.caep { color: #7fd1a0; border-color: #7fd1a0; } .badge.risc { color: #f0a77a; border-color: #f0a77a; } }
+ol.log { list-style: none; padding: 0; margin: 0.5rem 0; }
+.log-item { border-top: 1px solid var(--line); padding: 0.6rem 0; }
+.log-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
+.log-top time { color: var(--muted); font-size: 0.875rem; margin-left: auto; }
+.log-outcome { margin: 0.25rem 0; }
+.log-outcome.ended { color: var(--problem); font-weight: 600; }
+table.members { margin: 0.25rem 0; }
+table.members th { width: 11rem; font-weight: 500; color: var(--muted); }
+form.inline { margin: 0.5rem 0; }
+button.secondary { background: transparent; color: var(--accent); }
+.empty { color: var(--muted); }
+.page-tab .count:not(:empty) { display: inline-block; min-width: 1.4em; padding: 0 0.35em; margin-left: 0.25em; border-radius: 999px; background: var(--accent); color: var(--bg); font-size: 0.75rem; text-align: center; }
+.log-item.fresh { animation: fresh 2.5s ease-out; }
+@keyframes fresh { from { background: color-mix(in srgb, var(--accent) 18%, transparent); } to { background: transparent; } }
+#live-state { font-weight: 600; }
+.accounts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem; border: 1px solid var(--line); border-radius: 8px; margin: 0.5rem 0 1rem; }
+.accounts ul { display: inline-flex; flex-wrap: wrap; gap: 0.35rem; list-style: none; margin: 0; padding: 0; }
+.accounts li a, .accounts li strong { display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; border: 1px solid var(--line); text-decoration: none; }
+.accounts li[aria-current] strong { border-color: var(--accent); color: var(--accent); }
+.accounts-label { color: var(--muted); font-size: 0.875rem; }
+.button.small, button.small { padding: 0.3rem 0.6rem; font-size: 0.875rem; }
