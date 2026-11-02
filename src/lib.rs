@@ -25,3 +25,5 @@ pub use value::JsonMap;
 
 #[cfg(test)]
 mod suite;
+#[cfg(test)]
+mod trust_chain_test;
