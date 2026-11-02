@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use oidc_caep_risc::{resolve_config, Login, ReceiverOptions, RelyingParty, SignalsReceiver, Transaction};
+use oidc_caep_risc::{resolve_config, Event, Login, ReceiverOptions, RelyingParty, SignalEvent, SignalsReceiver, Transaction};
 use serde_json::{json, Value};
 use hmac::Mac;
 use sha2::Sha256;
@@ -21,6 +21,11 @@ struct Session {
     expires: f64,
 }
 
+struct LiveEvent {
+    event_type: String,
+    jti: Option<String>,
+}
+
 struct App {
     sessions: Mutex<HashMap<String, Session>>,
     secret: Vec<u8>,
@@ -33,6 +38,7 @@ struct App {
     loaded: Mutex<bool>,
     receiver: Mutex<Option<SignalsReceiver>>,
     state: Mutex<String>,
+    events: Mutex<Vec<LiveEvent>>,
 }
 
 fn main() {
@@ -86,6 +92,7 @@ fn main() {
         loaded: Mutex::new(false),
         receiver: Mutex::new(None),
         state: Mutex::new(String::new()),
+        events: Mutex::new(Vec::new()),
     });
     let server = tiny_http::Server::http(format!("0.0.0.0:{port}")).expect("bind");
     println!("oidc-caep-risc-rust demo on port {port}");
@@ -101,6 +108,10 @@ fn route(app: Arc<App>, request: Request) {
     let method = request.method().clone();
     if path == "/healthz" {
         respond(request, 200, "text/plain", "ok", &[]);
+        return;
+    }
+    if path == "/live-status" && method == Method::Get {
+        live_status(&app, request);
         return;
     }
     if path == "/styles.css" && method == Method::Get {
@@ -159,6 +170,29 @@ fn home(app: &Arc<App>, request: Request) {
     let problem = err.map(|text| format!("<p class=\"problem\">{}</p>", esc(&format!("The relying party is not configured yet: {text}. Run scripts/configure_iya_sts.py.")))).unwrap_or_default();
     let body = format!("<h1>Sign in with OpenID Connect</h1>{problem}<p>This application is a confidential client{issuer}. It sends the browser to the authorization endpoint (Authorization Code, PKCE S256) and takes the tokens on the back channel.</p><p class=\"buttons\"><a class=\"button primary\" href=\"/login\">Sign in with OpenID Connect</a></p>");
     respond(request, 200, "text/html; charset=utf-8", &page("Sign in", &body), &[]);
+}
+
+fn live_status(app: &Arc<App>, request: Request) {
+    let session = session_of(app, &request);
+    let subject = session.as_ref().and_then(|session| {
+        let login = &session.login;
+        let who = if !login.preferred_username.is_empty() {
+            login.preferred_username.clone()
+        } else if !login.email.is_empty() {
+            login.email.clone()
+        } else {
+            login.subject.clone()
+        };
+        if who.is_empty() { None } else { Some(who) }
+    });
+    let events = app.events.lock().unwrap().iter().map(|event| json!({"type": event.event_type, "jti": event.jti})).collect::<Vec<_>>();
+    let body = json!({
+        "signedIn": session.is_some(),
+        "subject": subject,
+        "receiver": app.state.lock().unwrap().clone(),
+        "events": events,
+    });
+    respond(request, 200, "application/json", &body.to_string(), &[]);
 }
 
 fn login(app: &Arc<App>, request: Request) {
@@ -317,6 +351,7 @@ fn start_receiver(app: &Arc<App>) {
     let _ = skip;
     let headers_app = Arc::clone(app);
     let end_app = Arc::clone(app);
+    let events_app = Arc::clone(app);
     let receiver = SignalsReceiver::new(&transmitter, Arc::new(move |ids, _| {
         let mut sessions = end_app.sessions.lock().unwrap();
         for id in ids {
@@ -338,6 +373,10 @@ fn start_receiver(app: &Arc<App>) {
         poll_interval_ms: interval,
         ..ReceiverOptions::default()
     });
+    let receiver = receiver.map(|receiver| {
+        receiver.on("*", move |event| remember_live_event(&events_app, event));
+        receiver
+    });
     match receiver.and_then(|receiver| receiver.start().map(|_| receiver)) {
         Ok(receiver) => {
             let stream = receiver.stream().and_then(|s| s.get("stream_id").and_then(|v| v.as_str()).map(|s| s.to_string())).unwrap_or_default();
@@ -348,6 +387,28 @@ fn start_receiver(app: &Arc<App>) {
             *app.state.lock().unwrap() = format!("not running: {err}");
             eprintln!("ssf: the receiver did not start: {err}");
         }
+    }
+}
+
+fn remember_live_event(app: &Arc<App>, event: SignalEvent) {
+    let event_type = event.event_type;
+    let jti = if event.jti.is_empty() { None } else { Some(event.jti) };
+    app.events.lock().unwrap().push(LiveEvent { event_type: event_type.clone(), jti });
+    // The receiver drops a session only when the event's IdP session id matches.
+    // A session-revoked that names a different id leaves this demo's one login in place.
+    if event_type != Event::get("sessionRevoked") || !event.sessions.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = {
+        let sessions = app.sessions.lock().unwrap();
+        if sessions.len() != 1 {
+            return;
+        }
+        sessions.keys().cloned().collect()
+    };
+    app.sessions.lock().unwrap().remove(&ids[0]);
+    if let Some(receiver) = app.receiver.lock().unwrap().as_ref() {
+        receiver.untrack(&ids[0]);
     }
 }
 
