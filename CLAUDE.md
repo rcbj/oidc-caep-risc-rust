@@ -20,10 +20,6 @@ Rust edition 2021. RSA signatures use the `rsa` crate. PSS, ECDSA, and EdDSA are
 
 ## Usage
 
-```sh
-cargo test
-```
-
 ```rust
 let rp = oidc_caep_risc::RelyingParty::from_file("oidc.json")?;
 let request = rp.authorize()?;
@@ -34,16 +30,18 @@ Keep the transaction (state, nonce, code verifier) until the browser returns. To
 
 ## Tests
 
-```sh
-cargo test
+```bash
+docker build --target test .
 ```
+
+The `test` stage runs `cargo test` in `rust:1-bookworm`. GitHub Actions uses that command. Do not run Cargo on the host. The demo image does not run the suite.
 
 ## Demo
 
 `docker-compose.yml` sets `network_mode: host`. The process binds `PORT`, default 3000. `ENV PORT=3000` in the image keeps an unset value on 3000, and the health check calls `http://127.0.0.1:${PORT}/healthz`.
 
 ```sh
-cargo run --bin demo
+docker compose up --build
 ```
 
 `GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session.

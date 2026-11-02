@@ -1,5 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
 # SPDX-License-Identifier: MIT
+# `docker build --target test` runs the suite in this image.
+# The demo image below does not run it.
+FROM rust:1-bookworm AS test
+WORKDIR /src
+COPY . .
+RUN cargo test
+
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
