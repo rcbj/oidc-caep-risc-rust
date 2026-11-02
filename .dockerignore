@@ -1,2 +1,6 @@
 .git
 target
+# demo/generated holds the client secret the install script wrote. Only
+# tlsCa's file, the iya-sts listener CA trust chain, goes into an image.
+demo/generated/*
+!demo/generated/idp-ca.pem

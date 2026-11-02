@@ -131,6 +131,7 @@ def fetch_published(origin):
     target = urlsplit(origin)
     url = f"{target.scheme}://{target.netloc}/tls/server-certificate"
     context = ssl._create_unverified_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     request = Request(url, headers={"accept": "text/plain"})
     with urlopen(request, context=context, timeout=TIMEOUT) as response:
         if response.status != 200:

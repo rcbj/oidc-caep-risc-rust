@@ -29,6 +29,7 @@ TIMEOUT_S = 15
 def _ssl_context(tls):
     tls = tls or {}
     context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     ca = tls.get("ca")
     if ca:
         context.load_verify_locations(cadata=ca)

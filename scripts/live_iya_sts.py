@@ -21,6 +21,23 @@ container whose name starts with sts. Otherwise it clones main (or builds
 IYA_STS_SRC) and removes only the container it started. The demo container it
 removes is oidc-caep-risc-rust-live-demo. It never runs docker compose up, and
 it never uses --network host for iya-sts.
+
+The trust chain goes in the way a user's does. The script copies this checkout
+to a scratch build context (without demo/generated, .git or target), points
+that copy's demo/oidc.json at this iya-sts and this demo (URLs only; tlsCa is
+never rewritten), and runs the install script against it, which writes the
+listener CA trust chain to the file tlsCa names (demo/generated/idp-ca.pem).
+THEN it builds the demo image, which carries that file from build time, checks
+the image's copy equals the saved one and that nothing else of demo/generated
+is in the image, and THEN runs the demo with only the client secret mounted,
+file by file, and no start-time refresh (TLS_CA_REFRESH=0). Nothing here
+fetches the CA for the demo or mounts a CA into its container. This script
+reads the saved chain for its own HTTPS client.
+
+Secrets reach docker and the install script as -e NAME and through the
+environment, never on a command line. No log line carries a URL from the
+sign-in (its query and path hold opaque handles, and some answer requests that
+carried the password): each request is logged by a fixed label.
 """
 
 import base64
@@ -116,11 +133,12 @@ class Client:
     def __init__(self, ca_file):
         self.jar = http.cookiejar.CookieJar(policy=LoopbackCookiePolicy())
         self.ssl = ssl.create_default_context(cafile=str(ca_file))
+        self.ssl.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def request(self, method, url, body=None, headers=None, timeout=60):
         parts = urllib.parse.urlsplit(url)
         if parts.scheme not in ("http", "https"):
-            raise RuntimeError(f"refusing {url}")
+            raise RuntimeError("refusing a URL that is not http(s)")
         port = parts.port or (443 if parts.scheme == "https" else 80)
         path = parts.path or "/"
         if parts.query:
@@ -212,22 +230,47 @@ def wait_port(port, timeout):
     raise RuntimeError(f"127.0.0.1:{port} did not accept a connection")
 
 
-def fetch_ca(origin, dest):
+def wait_ready(origin, timeout):
+    """Wait for discovery to answer. Readiness only: nothing is trusted from it."""
     parts = urllib.parse.urlsplit(origin)
     context = ssl._create_unverified_context()
-    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=30)
-    try:
-        conn.request("GET", "/tls/server-certificate")
-        response = conn.getresponse()
-        body = response.read()
-    finally:
-        conn.close()
-    if response.status != 200 or b"BEGIN CERTIFICATE" not in body:
-        raise RuntimeError(f"GET /tls/server-certificate answered {response.status}")
-    dest.write_bytes(body)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=10)
+        try:
+            conn.request("GET", (parts.path or "").rstrip("/") + "/.well-known/openid-configuration")
+            response = conn.getresponse()
+            response.read()
+            if response.status == 200:
+                return
+            last = f"answered {response.status}"
+        except OSError as err:
+            last = str(err)
+        finally:
+            conn.close()
+        time.sleep(2)
+    raise RuntimeError(f"{origin} discovery did not answer 200: {last}")
+
+
+def copy_context(dest):
+    """This checkout as a build context, without .git, target or demo/generated."""
+
+    def ignore(directory, names):
+        here = Path(directory).resolve()
+        skipped = {".git", "__pycache__"} & set(names)
+        if here == ROOT:
+            skipped |= {"target"} & set(names)
+        if here == ROOT / "demo":
+            skipped |= {"generated"} & set(names)
+        return skipped
+
+    shutil.copytree(ROOT, dest, ignore=ignore)
 
 
 def rewrite_config(source, dest, sts_origin, demo_origin):
+    """Point the demo at this iya-sts and this demo origin. tlsCa is left alone."""
     raw = json.loads(source.read_text(encoding="utf-8"))
     origin = sts_origin.rstrip("/")
     raw["issuer"] = origin
@@ -270,6 +313,26 @@ def autopost_form(payload):
     return None
 
 
+# What a sign-in request is logged as. A label is one of these constants, never
+# text taken from the URL: the URLs carry pending-step handles, codes and state,
+# and some come back from requests that carried the password.
+LOG_PATHS = (
+    "/authn-api/pending/",
+    "/authn-api/consent/",
+    "/authn-api/mfa/",
+    "/gnap-api/approve/",
+    "/authn/login",
+    "/authn/mfa-setup",
+    "/authn/post-login",
+    "/oauth2/consent",
+    "/oauth2/authorize",
+    "/gnap/approve/",
+    "/callback",
+    "/login",
+    "/live-status",
+)
+
+
 class Driver:
     def __init__(self, client, sts_origin, demo_origin, username, password):
         self.client = client
@@ -281,9 +344,18 @@ class Driver:
     def sts(self, url):
         return origin_of(url).rstrip("/") == self.sts_origin
 
+    def label(self, url):
+        """A constant naming where a request went, never text from the URL."""
+        where = "iya-sts" if self.sts(url) else "demo" if origin_of(url).rstrip("/") == self.demo_origin else "elsewhere"
+        path = path_of(url)
+        for known in LOG_PATHS:
+            if path.startswith(known):
+                return f"{where} {known}"
+        return f"{where} (another path)"
+
     def get(self, url):
         status, headers, payload = self.client.request("GET", url, headers={"accept": "text/html,application/json"})
-        print(f"GET {status} {url}", flush=True)
+        print(f"GET {status} {self.label(url)}", flush=True)
         return status, headers, payload
 
     def post_json(self, url, body, csrf):
@@ -294,7 +366,7 @@ class Driver:
             "origin": self.sts_origin,
             "x-csrf-token": csrf,
         })
-        print(f"POST {status} {url}", flush=True)
+        print(f"POST {status} {self.label(url)}", flush=True)
         return status, headers, payload
 
     def open_view(self, shell_url, api_url):
@@ -302,13 +374,13 @@ class Driver:
         if status in (301, 302, 303, 307, 308):
             return {"redirect": resolve_url(shell_url, one_header(headers, "location"))}
         view_status, _headers, view_payload = self.client.request("GET", api_url, headers={"accept": "application/json"})
-        print(f"GET {view_status} {api_url}", flush=True)
+        print(f"GET {view_status} {self.label(api_url)}", flush=True)
         parsed = json_body(view_payload) or {}
         if view_status in (301, 302, 303, 307, 308):
             return {"redirect": resolve_url(api_url, one_header(_headers, "location"))}
         if not parsed.get("csrf"):
             snippet = (view_payload or payload or b"")[:400].decode("utf-8", "replace")
-            raise RuntimeError(f"{api_url} answered {view_status} without a csrf token: {snippet}")
+            raise RuntimeError(f"{self.label(api_url)} answered {view_status} without a csrf token: {snippet}")
         return {"view": parsed.get("view") or {}, "csrf": parsed["csrf"], "json": parsed}
 
     def act(self, url):
@@ -352,16 +424,16 @@ class Driver:
                 "content-type": "application/x-www-form-urlencoded",
                 "origin": origin_of(url),
             })
-            print(f"POST {posted} {action}", flush=True)
+            print(f"POST {posted} {self.label(action)}", flush=True)
             if posted in (301, 302, 303, 307, 308):
                 return resolve_url(action, one_header(post_headers, "location"))
             if origin_of(action).rstrip("/") == self.demo_origin:
                 return None
-            raise RuntimeError(f"the auto-posted form stayed at {action} ({posted})")
+            raise RuntimeError(f"the auto-posted form stayed at {self.label(action)} ({posted})")
         if origin_of(url).rstrip("/") == self.demo_origin and status < 400:
             return None
         snippet = payload[:500].decode("utf-8", "replace")
-        raise RuntimeError(f"the sign-in stopped at {status} {url}: {snippet}")
+        raise RuntimeError(f"the sign-in stopped at {status} {self.label(url)}: {snippet}")
 
     def after_act(self, url, status, headers, payload):
         parsed = json_body(payload) or {}
@@ -393,7 +465,7 @@ class Driver:
         view = opened["view"]
         optional = page == "post-login" or (isinstance(view.get("setup"), dict) and view["setup"].get("optional"))
         if not optional:
-            raise RuntimeError(f"a required step is in the way at {url}")
+            raise RuntimeError(f"a required step is in the way at {self.label(url)}")
         posted, post_headers, post_body = self.post_json(
             f"{self.sts_origin}/authn-api/mfa/{urllib.parse.quote(pending)}/{operation}",
             {},
@@ -429,7 +501,7 @@ class Driver:
             if not nxt:
                 return
             url = nxt
-        raise RuntimeError(f"the sign-in did not finish; last URL {url}")
+        raise RuntimeError(f"the sign-in did not finish; last at {self.label(url)}")
 
     def status(self):
         status, _headers, payload = self.client.request(
@@ -539,7 +611,7 @@ def prepare_sts(sts_port, secret):
         "-e", "STS_CLUSTER_MODE=off",
         "-e", "STS_WORKERS_REQUEST_COUNT=0",
         "-e", "STS_WORKERS_SURFACE_COUNT=0",
-        "-e", f"STS_ADMIN_API_CLIENT_SECRET={secret}",
+        "-e", "STS_ADMIN_API_CLIENT_SECRET",
         "-e", "STS_LOG_LEVEL=info",
         image,
     )
@@ -580,6 +652,11 @@ def main():
     secret = os.environ.get("ADMIN_API_CLIENT_SECRET") or os.environ.get("STS_ADMIN_API_CLIENT_SECRET") or secrets.token_urlsafe(24)
     password = os.environ.get(PROFILE["password_env"]) or secrets.token_urlsafe(18)
     username = PROFILE["test_user"]
+    # Secrets reach docker and the install script as -e NAME and through this
+    # environment, never on a printed command line.
+    os.environ["ADMIN_API_CLIENT_SECRET"] = secret
+    os.environ["STS_ADMIN_API_CLIENT_SECRET"] = secret
+    os.environ[PROFILE["password_env"]] = password
     sts_origin, sts_name = prepare_sts(sts_port, secret)
     demo_origin = f"http://127.0.0.1:{demo_port}"
     demo_name = PROFILE["repo"] + "-live-demo"
@@ -587,30 +664,35 @@ def main():
     work = Path(tempfile.mkdtemp(prefix=PROFILE["repo"] + "-live-"))
     try:
         wait_port(urllib.parse.urlsplit(sts_origin).port or 443, 120)
-        ca_file = work / "idp-ca.pem"
-        deadline = time.time() + 90
-        last_error = None
-        while time.time() < deadline:
-            try:
-                fetch_ca(sts_origin, ca_file)
-                last_error = None
-                break
-            except Exception as err:
-                last_error = err
-                time.sleep(2)
-        if last_error:
-            raise last_error
-        config = work / "oidc.json"
-        rewrite_config(ROOT / PROFILE["config_file"], config, sts_origin, demo_origin)
+        wait_ready(sts_origin, 90)
+        context = work / "context"
+        copy_context(context)
+        config = context / PROFILE["config_file"]
+        rewrite_config(config, config, sts_origin, demo_origin)
+        tls_ca = json.loads(config.read_text(encoding="utf-8")).get("tlsCa")
+        ca_file = config.parent / tls_ca
+        # The install script first: it writes the client secret and tlsCa's file.
         configure_demo(config, sts_origin, demo_origin, username, password, secret)
-        docker("build", "-t", image, str(ROOT))
+        if "BEGIN CERTIFICATE" not in (ca_file.read_text(encoding="utf-8") if ca_file.exists() else ""):
+            raise RuntimeError(f"the install script did not write tlsCa's file {tls_ca}")
+        # THEN the demo image, which carries the chain from build time.
+        docker("build", "-t", image, str(context))
+        baked = docker("run", "--rm", "--entrypoint", "cat", image, f"/app/demo/{tls_ca}", capture_output=True).stdout
+        if baked != ca_file.read_text(encoding="utf-8"):
+            raise RuntimeError(f"the demo image's /app/demo/{tls_ca} is not the chain the install script saved")
+        chain_count = baked.count("BEGIN CERTIFICATE")
+        listed = docker("run", "--rm", "--entrypoint", "ls", image, "-A", "/app/demo/generated", capture_output=True).stdout.split()
+        if listed != [Path(tls_ca).name]:
+            raise RuntimeError(f"the demo image's /app/demo/generated holds {listed}, not only the trust chain")
+        print(f"the demo image carries the {chain_count}-certificate chain at /app/demo/{tls_ca}", flush=True)
+        secret_file = config.parent / "generated" / "client-secret"
         docker_rm(demo_name)
         docker(
             "run", "-d", "--name", demo_name, "--network", "host",
-            "-v", f"{work}:/work",
+            "-v", f"{secret_file}:/app/demo/generated/client-secret:ro",
             "-e", f"PORT={demo_port}",
             "-e", f"PUBLIC_URL={demo_origin}",
-            "-e", "OIDC_CONFIG=/work/oidc.json",
+            "-e", "TLS_CA_REFRESH=0",
             image,
         )
         deadline = time.time() + 90
@@ -662,7 +744,12 @@ def main():
             ),
             "session-revoked to end the local session",
         )
-        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "events": finished.get("events")}, indent=2))
+        print(json.dumps({
+            "ok": True,
+            "subject": signed_in.get("subject"),
+            "tlsCaInImage": chain_count,
+            "events": finished.get("events"),
+        }, indent=2))
     finally:
         docker_rm(demo_name)
         if sts_name:

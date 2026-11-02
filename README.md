@@ -27,7 +27,15 @@ The suite runs in a container.
 
 The tests build an in-process stub provider and a stub transmitter. They do not need a live iya-sts.
 
-`python3 scripts/live_iya_sts.py` is the live half. It builds this demo image, starts iya-sts when `IYA_STS_URL` is unset, registers the demo, signs in, and requires a credential-change event and a session-revoked event on `GET /live-status`. The second event ends the local session. It never binds port 3000 or 8081. The nightly workflow runs the unit suite and this script. `.github/workflows/nightly.yml` runs at 07:02 UTC (`2 7 * * *`) and on `workflow_dispatch`. `IYA_STS_IMAGE` starts a fresh container from an image already built; without it or `IYA_STS_URL` the script clones and builds iya-sts `main`. `LIVE_STS_PORT` defaults to 18516 and `LIVE_DEMO_PORT` to 18616; the script refuses 3000, 8081, and 18481 through 18495. Registration runs `scripts/configure_iya_sts.py` with the host's stdlib python3, never Cargo. Always use a fresh iya-sts: a second registration of the same client fails.
+`python3 scripts/live_iya_sts.py` is the live half. It starts iya-sts when `IYA_STS_URL` is unset, copies this checkout (without `demo/generated`) to a scratch build context, runs the install script there (which writes the client secret and the trust chain), then builds the demo image, checks the image carries that chain and nothing else of `demo/generated`, runs the demo with only the client secret mounted and `TLS_CA_REFRESH=0`, signs in, and requires a credential-change event and a session-revoked event on `GET /live-status`. The second event ends the local session. It never binds port 3000 or 8081. The nightly workflow runs the unit suite and this script. `.github/workflows/nightly.yml` runs at 07:02 UTC (`2 7 * * *`) and on `workflow_dispatch`. `IYA_STS_IMAGE` starts a fresh container from an image already built; without it or `IYA_STS_URL` the script clones and builds iya-sts `main`. `LIVE_STS_PORT` defaults to 18516 and `LIVE_DEMO_PORT` to 18616; the script refuses 3000, 8081, and 18481 through 18495. Registration runs `scripts/configure_iya_sts.py` with the host's stdlib python3, never Cargo. Always use a fresh iya-sts: a second registration of the same client fails.
+
+## iya-sts trust chain (`tlsCa`)
+
+`tlsCa` names iya-sts's TLS listener CA trust chain; in `demo/oidc.json` it is `generated/idp-ca.pem` (relative to `demo/`). The library adds every certificate in that file as a trust anchor of its TLS connector, so the whole chain works and the path ends at the Root. It also verifies the host name against the leaf's subjectAltName (a DNS name, or an IP literal such as `127.0.0.1`). It reads the file for discovery, the token, UserInfo and JWKS requests, and the Shared Signals receiver.
+
+`scripts/configure_iya_sts.py` writes it on every run (through `scripts/trust_chain.py`'s `save_trust_chain()`): the whole chain iya-sts publishes at `GET /tls/server-certificate` (leaf, TLS Issuing CA, Intermediate, Root), or the chain the TLS handshake presents when that endpoint is missing. It prints the path, the trust anchor's subject, and its SHA-256; compare the anchor with the Root CA on iya-sts's Server configuration, PKI page. The fetch itself is not verified (trust on first use). `python3 scripts/trust_chain.py --config demo/oidc.json` refreshes only the chain.
+
+The demo image build copies that file in: `.dockerignore` admits only `demo/generated/idp-ca.pem` from `demo/generated/` (the client secret stays out), and `COPY demo demo`, after `cargo build`, puts it at `/app/demo/generated/idp-ca.pem`, where `tlsCa` names it. A build with no chain file yet (a fresh clone, CI) still succeeds and carries none. Run the install script, then build the image; after running it against a different iya-sts, rebuild (`docker compose up --build`). The entrypoint still refreshes the chain from the provider at start unless `TLS_CA_REFRESH=0`, and Compose also mounts `demo/generated`, which holds the same file.
 
 ## Layout
 
@@ -36,7 +44,9 @@ The tests build an in-process stub provider and a stub transmitter. They do not 
 | `src` | The library, crate `oidc-caep-risc`. |
 | `src/suite.rs` | `cargo test` ports of the Python relying-party and Shared Signals tests. |
 | `demo` | `demo/main.rs`. Config is `demo/oidc.json`. |
-| `scripts/configure_iya_sts.py` | Registers the confidential client on iya-sts. Loopback redirects follow the running container's `PORT`, then the shell `PORT`. |
+| `scripts/configure_iya_sts.py` | Registers the confidential client on iya-sts and saves its listener CA trust chain where `tlsCa` names it. Loopback redirects follow the running container's `PORT`, then the shell `PORT`. |
+| `scripts/trust_chain.py` | Saves iya-sts's listener CA trust chain. |
+| `src/trust_chain_test.rs` | The trust chain tests. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
 
 ## Demo
