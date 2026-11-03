@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use oidc_caep_risc::{resolve_config, Event, Login, ReceiverOptions, RelyingParty, SignalEvent, SignalsReceiver, Transaction};
+use oidc_caep_risc::{is_loopback, resolve_config, Event, Login, ReceiverOptions, RelyingParty, SignalEvent, SignalsReceiver, Transaction};
 use serde_json::{json, Value};
 use hmac::Mac;
 use sha2::Sha256;
@@ -33,7 +33,7 @@ struct App {
     config_path: String,
     public_url: String,
     public_given: bool,
-    rp: Mutex<Option<RelyingParty>>,
+    rp: Mutex<Option<Arc<RelyingParty>>>,
     rp_err: Mutex<Option<String>>,
     loaded: Mutex<bool>,
     receiver: Mutex<Option<SignalsReceiver>>,
@@ -73,7 +73,7 @@ fn main() {
                 let redirect = obj.get("redirectUri").and_then(|v| v.as_str()).or_else(|| obj.get("redirect_uri").and_then(|v| v.as_str())).unwrap_or("http://localhost/");
                 if let Ok(parsed) = url::Url::parse(redirect) {
                     let host = parsed.host_str().unwrap_or("");
-                    secure = parsed.scheme() == "https" || host == "localhost" || host == "127.0.0.1";
+                    secure = parsed.scheme() == "https" || is_loopback(host);
                 }
             }
         }
@@ -145,8 +145,7 @@ fn route(app: Arc<App>, request: Request) {
 
 fn home(app: &Arc<App>, request: Request) {
     let session = session_of(app, &request);
-    let (guard, err) = relying_party(app);
-    let rp = guard.as_ref();
+    let (rp, err) = relying_party(app);
     if let Some(session) = session {
         let login = &session.login;
         let who = if !login.preferred_username.is_empty() { login.preferred_username.clone() } else if !login.email.is_empty() { login.email.clone() } else { login.subject.clone() };
@@ -157,6 +156,14 @@ fn home(app: &Arc<App>, request: Request) {
             }
             rows.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", esc(name), esc(value)));
         }
+        // The relying party's session cache answers with a valid access token,
+        // refreshing it (with a DPoP proof when DPoP is in use) when it is close to expiry.
+        let token = match rp.as_ref().map(|rp| rp.session_access_token(&cookie_value(&request, "oidc_session"))) {
+            Some(Ok(access)) => format!("{} access token, valid", access.token_type),
+            Some(Err(err)) => format!("no valid access token ({err})"),
+            None => "no relying party".to_string(),
+        };
+        rows.push_str(&format!("<tr><th>Access token</th><td>{}</td></tr>", esc(&token)));
         let body = format!("<h1>Signed in as {}</h1><table class=\"facts\">{rows}</table><p><small>The access token and the refresh token stay in this process. This page does not show them.</small></p><p><small>Shared Signals: {}</small></p><form method=\"post\" action=\"/logout\"><button type=\"submit\">Sign out</button></form>", esc(&who), esc(&app.state.lock().unwrap()));
         respond(request, 200, "text/html; charset=utf-8", &page("Signed in", &body), &[]);
         return;
@@ -196,15 +203,14 @@ fn live_status(app: &Arc<App>, request: Request) {
 }
 
 fn login(app: &Arc<App>, request: Request) {
-    let (guard, err) = relying_party(app);
-    let rp = guard.as_ref();
+    let (rp, err) = relying_party(app);
     let Some(rp) = rp else {
         respond(request, 500, "text/html; charset=utf-8", &page("Error", &format!("<h1>Something went wrong</h1><p class=\"problem\">{}</p>", esc(&err.unwrap_or_default()))), &[]);
         return;
     };
     match rp.authorize() {
         Ok(txn) => {
-            let sealed = seal(app, &json!({"state": txn.state, "nonce": txn.nonce, "code_verifier": txn.code_verifier, "redirect_uri": txn.redirect_uri}).to_string());
+            let sealed = seal(app, &json!({"state": txn.state, "nonce": txn.nonce, "code_verifier": txn.code_verifier, "redirect_uri": txn.redirect_uri, "acr_values": txn.acr_values}).to_string());
             redirect(request, 302, &txn.url, &[cookie(app, "oidc_txn", &sealed, "/callback", 600)]);
         }
         Err(err) => respond(request, 500, "text/html; charset=utf-8", &page("Error", &format!("<h1>Something went wrong</h1><p class=\"problem\">{}</p>", esc(&err.to_string()))), &[]),
@@ -213,8 +219,7 @@ fn login(app: &Arc<App>, request: Request) {
 
 fn callback(app: &Arc<App>, request: Request, url: &str) {
     let clear = cookie(app, "oidc_txn", "", "/callback", 0);
-    let (guard, err) = relying_party(app);
-    let rp = guard.as_ref();
+    let (rp, err) = relying_party(app);
     let Some(rp) = rp else {
         respond(request, 500, "text/html; charset=utf-8", &page("Error", &format!("<h1>Something went wrong</h1><p class=\"problem\">{}</p>", esc(&err.unwrap_or_default()))), &[clear]);
         return;
@@ -235,15 +240,15 @@ fn callback(app: &Arc<App>, request: Request, url: &str) {
         nonce: txn_doc.get("nonce").and_then(|v| v.as_str()).unwrap_or("").into(),
         code_verifier: txn_doc.get("code_verifier").and_then(|v| v.as_str()).unwrap_or("").into(),
         redirect_uri: txn_doc.get("redirect_uri").and_then(|v| v.as_str()).unwrap_or("").into(),
-        url: String::new(),
-        max_age: None,
-        expected_sub: String::new(),
+        acr_values: txn_doc.get("acr_values").and_then(|v| v.as_str()).unwrap_or("").into(),
+        ..Transaction::default()
     };
-    match rp.complete(&query, &txn) {
+    let mut buf = vec![0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
+    let sid = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &buf);
+    // The tokens go in the relying party's session cache under the same id as the cookie.
+    match rp.complete_session(&query, &txn, &sid) {
         Ok(login) => {
-            let mut buf = vec![0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
-            let sid = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &buf);
             if let Some(receiver) = app.receiver.lock().unwrap().as_ref() {
                 let mut session = serde_json::Map::new();
                 session.insert("local_id".into(), json!(sid));
@@ -272,6 +277,9 @@ fn logout(app: &Arc<App>, request: Request) {
         if sid.is_empty() { None } else { Some(sid) }
     }) {
         app.sessions.lock().unwrap().remove(&sid);
+        if let Some(rp) = app.rp.lock().unwrap().as_ref() {
+            rp.remove_session(&sid);
+        }
         if let Some(receiver) = app.receiver.lock().unwrap().as_ref() {
             receiver.untrack(&sid);
         }
@@ -279,24 +287,24 @@ fn logout(app: &Arc<App>, request: Request) {
     redirect(request, 303, "/", &[cookie(app, "oidc_session", "", "/", 0)]);
 }
 
-fn relying_party(app: &Arc<App>) -> (std::sync::MutexGuard<'_, Option<RelyingParty>>, Option<String>) {
+fn relying_party(app: &Arc<App>) -> (Option<Arc<RelyingParty>>, Option<String>) {
     let mut loaded = app.loaded.lock().unwrap();
     if !*loaded {
         *loaded = true;
         match load(app) {
             Ok(rp) => {
-                *app.rp.lock().unwrap() = Some(rp);
+                *app.rp.lock().unwrap() = Some(Arc::new(rp));
                 drop(loaded);
                 start_receiver(app);
                 let err = app.rp_err.lock().unwrap().clone();
-                return (app.rp.lock().unwrap(), err);
+                return (app.rp.lock().unwrap().clone(), err);
             }
             Err(err) => *app.rp_err.lock().unwrap() = Some(err),
         }
     }
     drop(loaded);
     let err = app.rp_err.lock().unwrap().clone();
-    (app.rp.lock().unwrap(), err)
+    (app.rp.lock().unwrap().clone(), err)
 }
 
 fn load(app: &Arc<App>) -> Result<RelyingParty, String> {
@@ -325,9 +333,8 @@ fn load(app: &Arc<App>) -> Result<RelyingParty, String> {
 }
 
 fn start_receiver(app: &Arc<App>) {
-    let (transmitter, interval, client_id, ca, skip) = {
-        let guard = app.rp.lock().unwrap();
-        let Some(rp) = guard.as_ref() else {
+    let (rp, transmitter, interval, client_id, ca) = {
+        let Some(rp) = app.rp.lock().unwrap().clone() else {
             return;
         };
         if rp.config().get("signals") == Some(&Value::Bool(false)) || rp.config().get("ssf").is_none() {
@@ -346,10 +353,8 @@ fn start_receiver(app: &Arc<App>) {
         let interval = ssf.get("pollIntervalMs").and_then(|v| v.as_i64()).or_else(|| ssf.get("pollIntervalMs").and_then(|v| v.as_u64().map(|n| n as i64))).filter(|n| *n > 0).unwrap_or(5000);
         let client_id = rp.config().get("clientId").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let ca = rp.tls_ca().map(|s| s.to_string());
-        (transmitter, interval, client_id, ca, false)
+        (Arc::clone(&rp), transmitter, interval, client_id, ca)
     };
-    let _ = skip;
-    let headers_app = Arc::clone(app);
     let end_app = Arc::clone(app);
     let events_app = Arc::clone(app);
     let receiver = SignalsReceiver::new(&transmitter, Arc::new(move |ids, _| {
@@ -359,16 +364,10 @@ fn start_receiver(app: &Arc<App>) {
         }
     }), ReceiverOptions {
         tls_ca: ca,
-        headers: Some(Arc::new(move || {
-            let guard = headers_app.rp.lock().unwrap();
-            let Some(rp) = guard.as_ref() else {
-                return Vec::new();
-            };
-            match rp.client_credentials("ssf.manage") {
-                Ok(access) if !access.access_token.is_empty() => vec![("authorization".into(), format!("Bearer {}", access.access_token))],
-                _ => Vec::new(),
-            }
-        })),
+        // Every transmitter call carries the relying party's ssf.manage token, with a DPoP
+        // proof when that token is DPoP-bound; an ended session leaves its session cache.
+        relying_party: Some(rp),
+        scope: "ssf.manage".into(),
         description: format!("oidc-caep-risc-rust demo ({client_id})"),
         poll_interval_ms: interval,
         ..ReceiverOptions::default()
@@ -407,6 +406,9 @@ fn remember_live_event(app: &Arc<App>, event: SignalEvent) {
         sessions.keys().cloned().collect()
     };
     app.sessions.lock().unwrap().remove(&ids[0]);
+    if let Some(rp) = app.rp.lock().unwrap().as_ref() {
+        rp.remove_session(&ids[0]);
+    }
     if let Some(receiver) = app.receiver.lock().unwrap().as_ref() {
         receiver.untrack(&ids[0]);
     }
@@ -551,7 +553,7 @@ fn on_port(raw: &str, port: u16) -> String {
         return raw.to_string();
     };
     let host = parts.host_str().unwrap_or("");
-    if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+    if !is_loopback(host) {
         return raw.to_string();
     }
     let _ = parts.set_port(Some(port));

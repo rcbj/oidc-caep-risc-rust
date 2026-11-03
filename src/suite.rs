@@ -27,14 +27,14 @@ const CLIENT: &str = "oidc-caep-risc-demo";
 const SECRET: &str = "test-secret";
 const SCOPES: &str = "openid profile email offline_access ssf.read ssf.manage";
 
-struct Keys {
-    provider: RsaPrivateKey,
-    client_pem: String,
-    client_public: RsaPublicKey,
-    provider_jwk: Value,
+pub(crate) struct Keys {
+    pub(crate) provider: RsaPrivateKey,
+    pub(crate) client_pem: String,
+    pub(crate) client_public: RsaPublicKey,
+    pub(crate) provider_jwk: Value,
 }
 
-fn keys() -> &'static Keys {
+pub(crate) fn keys() -> &'static Keys {
     static KEYS: OnceLock<Keys> = OnceLock::new();
     KEYS.get_or_init(|| {
         let mut rng = rand::thread_rng();
@@ -90,12 +90,12 @@ fn assertion_ok(assertion: &str, audience: &str) -> bool {
     VerifyingKey::<Sha256>::new(keys().client_public.clone()).verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature).is_ok()
 }
 
-struct Req {
-    method: String,
-    path: String,
-    query: HashMap<String, String>,
-    headers: HashMap<String, String>,
-    body: String,
+pub(crate) struct Req {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: HashMap<String, String>,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: String,
 }
 
 struct Stub {
@@ -139,7 +139,7 @@ fn start_provider() -> &'static Stub {
     stub
 }
 
-fn read_req(stream: &mut TcpStream) -> Option<Req> {
+pub(crate) fn read_req(stream: &mut TcpStream) -> Option<Req> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -206,7 +206,7 @@ fn urlencoding_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn write_res(stream: &mut TcpStream, status: u16, extra: &[(String, String)], body: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_res(stream: &mut TcpStream, status: u16, extra: &[(String, String)], body: &[u8]) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         201 => "Created",
@@ -230,12 +230,12 @@ fn write_res(stream: &mut TcpStream, status: u16, extra: &[(String, String)], bo
     Ok(())
 }
 
-fn json_res(status: u16, body: Value) -> (u16, Vec<(String, String)>, Vec<u8>) {
+pub(crate) fn json_res(status: u16, body: Value) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let raw = serde_json::to_vec(&body).unwrap_or_default();
     (status, vec![("Content-Type".into(), "application/json".into())], raw)
 }
 
-fn form(body: &str) -> HashMap<String, String> {
+pub(crate) fn form(body: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for pair in body.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -439,7 +439,7 @@ fn provider_config(stub: &Stub, over: Value) -> JsonMap {
     doc.as_object().cloned().unwrap()
 }
 
-fn manual(raw_url: &str) -> (u16, String) {
+pub(crate) fn manual(raw_url: &str) -> (u16, String) {
     let url = url::Url::parse(raw_url).unwrap();
     let mut stream = TcpStream::connect(format!("{}:{}", url.host_str().unwrap(), url.port().unwrap())).unwrap();
     let path = format!("{}{}", url.path(), url.query().map(|q| format!("?{q}")).unwrap_or_default());
@@ -458,7 +458,7 @@ fn manual(raw_url: &str) -> (u16, String) {
     (status, location)
 }
 
-fn query_of(location: &str) -> HashMap<String, String> {
+pub(crate) fn query_of(location: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Some(query) = location.split_once('?').map(|(_, q)| q) else {
         return out;
@@ -506,7 +506,7 @@ fn signs_in_with_pkce() {
     assert!(signed.request.url.contains("code_challenge="));
     assert!(signed.request.url.contains("code_challenge_method=S256"));
     assert!(!signed.request.url.contains("client_secret"));
-    let info = rp.userinfo(&signed.login.access_token, &signed.login.subject).unwrap();
+    let info = rp.userinfo(&signed.login.access_token, &signed.login.token_type, &signed.login.subject).unwrap();
     assert_eq!(info.get("sub").and_then(|v| v.as_str()), Some("user-1"));
     let end = rp.end_session_url(crate::EndSessionOptions { id_token: signed.login.id_token.clone(), state: "bye".into(), ..Default::default() });
     assert!(end.contains("/end-session"));
@@ -722,13 +722,13 @@ fn signals_flag() {
     let _ = Map::<String, Value>::new();
 }
 
-struct SsfKeys {
-    private: RsaPrivateKey,
-    other: RsaPrivateKey,
-    jwk: JsonMap,
+pub(crate) struct SsfKeys {
+    pub(crate) private: RsaPrivateKey,
+    pub(crate) other: RsaPrivateKey,
+    pub(crate) jwk: JsonMap,
 }
 
-fn ssf_keys() -> &'static SsfKeys {
+pub(crate) fn ssf_keys() -> &'static SsfKeys {
     static KEYS: OnceLock<SsfKeys> = OnceLock::new();
     KEYS.get_or_init(|| {
         let mut rng = rand::thread_rng();
@@ -745,7 +745,7 @@ fn ssf_keys() -> &'static SsfKeys {
     })
 }
 
-fn sign_set(payload: &Value, key: &RsaPrivateKey, header: Value) -> String {
+pub(crate) fn sign_set(payload: &Value, key: &RsaPrivateKey, header: Value) -> String {
     let h = b64url_encode(&serde_json::to_vec(&header).unwrap());
     let p = b64url_encode(&serde_json::to_vec(payload).unwrap());
     let signing = format!("{h}.{p}");
@@ -753,19 +753,64 @@ fn sign_set(payload: &Value, key: &RsaPrivateKey, header: Value) -> String {
     format!("{signing}.{}", URL_SAFE_NO_PAD.encode(sig))
 }
 
-struct Transmitter {
-    url: String,
-    order: Mutex<Vec<String>>,
-    queue: Mutex<HashMap<String, String>>,
-    acked: Mutex<Vec<String>>,
-    errs: Mutex<HashMap<String, String>>,
-    created: Mutex<i32>,
-    authorization: Mutex<String>,
-    verify_state: Mutex<String>,
-    verify_status: Mutex<u16>,
+pub(crate) struct Transmitter {
+    pub(crate) url: String,
+    pub(crate) order: Mutex<Vec<String>>,
+    pub(crate) queue: Mutex<HashMap<String, String>>,
+    pub(crate) acked: Mutex<Vec<String>>,
+    pub(crate) errs: Mutex<HashMap<String, String>>,
+    pub(crate) created: Mutex<i32>,
+    pub(crate) authorization: Mutex<String>,
+    pub(crate) verify_state: Mutex<String>,
+    pub(crate) verify_status: Mutex<u16>,
+    /// Every DPoP proof the transmitter accepted: (method, path, claims).
+    pub(crate) proofs: Mutex<Vec<(String, String, Value)>>,
+    /// When set, a DPoP request without this nonce is answered 401 use_dpop_nonce.
+    pub(crate) nonce: Mutex<Option<String>>,
+    pub(crate) nonce_refusals: Mutex<i32>,
 }
 
-fn start_transmitter() -> &'static Transmitter {
+/// A DPoP proof read and verified the way a server would (RFC 9449 section 4.3).
+pub(crate) struct Proof {
+    pub(crate) claims: Value,
+    pub(crate) jkt: String,
+}
+
+pub(crate) fn read_proof(proof: &str) -> Option<Proof> {
+    use p256::ecdsa::signature::Verifier as _;
+    let parts: Vec<&str> = proof.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).ok()?).ok()?;
+    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).ok()?).ok()?;
+    if header.get("typ")?.as_str()? != "dpop+jwt" || header.get("alg")?.as_str()? != "ES256" {
+        return None;
+    }
+    let jwk = header.get("jwk")?;
+    if jwk.get("kty")?.as_str()? != "EC" || jwk.get("crv")?.as_str()? != "P-256" || jwk.get("d").is_some() {
+        return None;
+    }
+    let x = jwk.get("x")?.as_str()?;
+    let y = jwk.get("y")?.as_str()?;
+    let mut point = vec![4u8];
+    point.extend(URL_SAFE_NO_PAD.decode(x).ok()?);
+    point.extend(URL_SAFE_NO_PAD.decode(y).ok()?);
+    let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).ok()?;
+    let sig = p256::ecdsa::Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).ok()?).ok()?;
+    key.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).ok()?;
+    for name in ["jti", "htm", "htu", "iat"] {
+        claims.get(name)?;
+    }
+    let canonical = format!("{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{x}\",\"y\":\"{y}\"}}");
+    Some(Proof { claims, jkt: URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())) })
+}
+
+pub(crate) fn ath_of(token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
+}
+
+pub(crate) fn start_transmitter() -> &'static Transmitter {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let tx: &'static Transmitter = Box::leak(Box::new(Transmitter {
@@ -778,6 +823,9 @@ fn start_transmitter() -> &'static Transmitter {
         authorization: Mutex::new(String::new()),
         verify_state: Mutex::new(String::new()),
         verify_status: Mutex::new(0),
+        proofs: Mutex::new(Vec::new()),
+        nonce: Mutex::new(None),
+        nonce_refusals: Mutex::new(0),
     }));
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -795,7 +843,29 @@ fn start_transmitter() -> &'static Transmitter {
 fn handle_tx(tx: &Transmitter, req: &Req) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let auth = req.headers.get("authorization").cloned().unwrap_or_default();
     *tx.authorization.lock().unwrap() = auth.clone();
-    if auth != "Bearer app-token" && req.path != "/.well-known/ssf-configuration" && !req.path.starts_with("/jwks") {
+    let mut accepted = auth == "Bearer app-token";
+    if auth == "DPoP app-token" {
+        let proof = req.headers.get("dpop").and_then(|raw| read_proof(raw));
+        let Some(proof) = proof else {
+            return (401, vec![("WWW-Authenticate".into(), "DPoP error=\"invalid_dpop_proof\"".into())], Vec::new());
+        };
+        let htu_ok = proof.claims["htu"].as_str() == Some(format!("{}{}", tx.url, req.path).as_str());
+        let htm_ok = proof.claims["htm"].as_str() == Some(req.method.as_str());
+        let ath_ok = proof.claims["ath"].as_str() == Some(ath_of("app-token").as_str());
+        if !(htu_ok && htm_ok && ath_ok) {
+            return (401, vec![("WWW-Authenticate".into(), "DPoP error=\"invalid_dpop_proof\"".into())], Vec::new());
+        }
+        let want = tx.nonce.lock().unwrap().clone();
+        if let Some(want) = want {
+            if proof.claims["nonce"].as_str() != Some(want.as_str()) {
+                *tx.nonce_refusals.lock().unwrap() += 1;
+                return (401, vec![("WWW-Authenticate".into(), "DPoP error=\"use_dpop_nonce\"".into()), ("DPoP-Nonce".into(), want)], Vec::new());
+            }
+        }
+        tx.proofs.lock().unwrap().push((req.method.clone(), req.path.clone(), proof.claims));
+        accepted = true;
+    }
+    if !accepted && req.path != "/.well-known/ssf-configuration" && !req.path.starts_with("/jwks") {
         return json_res(401, json!({"error": "invalid_token"}));
     }
     if req.path == "/.well-known/ssf-configuration" {
@@ -873,7 +943,7 @@ fn handle_tx(tx: &Transmitter, req: &Req) -> (u16, Vec<(String, String)>, Vec<u8
     json_res(404, json!({"error": "not_found"}))
 }
 
-fn deliver(tx: &Transmitter, event_type: &str, sub_id: Value, extra: Value, key: Option<&RsaPrivateKey>) -> String {
+pub(crate) fn deliver(tx: &Transmitter, event_type: &str, sub_id: Value, extra: Value, key: Option<&RsaPrivateKey>) -> String {
     let mut buf = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
     let jti = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",

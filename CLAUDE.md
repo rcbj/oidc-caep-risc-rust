@@ -6,7 +6,9 @@ A confidential OpenID Connect relying party for a traditional Rust application, 
 
 The license is the MIT License in `LICENSE`. A pull request merged into `main` publishes the crate to crates.io after the test workflow succeeds on that commit. A direct push does not. The token is the `CARGO_REGISTRY_TOKEN` repository secret. A version already on crates.io stays there; the next release is a new `version` in `Cargo.toml`. `develop` and `main` are the branches the test workflow runs.
 
-Rust edition 2021. RSA signatures use the `rsa` crate. PSS, ECDSA, and EdDSA are not implemented.
+Rust edition 2021. RSA (PKCS #1 v1.5 and PSS) uses the `rsa` crate, ECDSA `p256`, `p384` and `p521`, EdDSA `ed25519-dalek`. Every algorithm in `keys::ASYMMETRIC` verifies, and `src/profile_test.rs` signs an ID token and a SET in each of them; do not list an algorithm there that `verify_signature` cannot check. ID tokens default to `["RS256"]` (`idTokenSigningAlgs`).
+
+Issue #18 (shared with the six sibling libraries, same keys and defaults): `dpop` (`auto`/`always`/`never`, ES256 only, key generated at creation or `dpopKey`), `src/dpop.rs`; `acrValues` and the `acr` check; `require_pushed_authorization_requests`; `idTokenSigningAlgs` intersected with the advertised list; `requireIdTokenTypAndAtHash`; `config::apply_defaults`, which `RelyingParty::create` runs too, so a directly created client gets the same defaults and redirect-URI rule as `from_file` (`allowInsecure` no longer relaxes redirect URIs); and the session cache (`complete_session`, `session_access_token`, `remove_session`, `SessionStore`). `SignalsReceiver` takes `relying_party` to authorize transmitter calls (DPoP-aware) and to clear ended sessions from that cache. The tests are `src/profile_test.rs`, with their own configurable stub provider; the suite's stub transmitter accepts `DPoP app-token` with a verified proof and can demand a nonce.
 
 ## Layout
 
@@ -14,6 +16,7 @@ Rust edition 2021. RSA signatures use the `rsa` crate. PSS, ECDSA, and EdDSA are
 |---|---|
 | crate `oidc-caep-risc` | The library. `from_file`, `authorize`, `complete`. |
 | `src/suite.rs` | `cargo test`. A stub provider and a stub transmitter. No live iya-sts. |
+| `src/profile_test.rs` | Issue #18's tests: DPoP, acr, PAR required, algorithms, typ/at_hash, creation defaults, the session cache. |
 | `src/trust_chain_test.rs` | The trust chain: the registrar writes all four certificates; the library trusts the file, refuses the leaf alone, a wrong host name, and a foreign leaf sent with the real CA certificates. |
 | `demo` | `demo/main.rs` and `demo/public/`. Config is `demo/oidc.json`. |
 | `scripts` | `configure_iya_sts.py` registers the confidential client. `trust_chain.py` saves the listener CA trust chain to the file named by `tlsCa`. `live_iya_sts.py` is the live sign-in, separate from the unit suite. |
@@ -24,10 +27,11 @@ Rust edition 2021. RSA signatures use the `rsa` crate. PSS, ECDSA, and EdDSA are
 ```rust
 let rp = oidc_caep_risc::RelyingParty::from_file("oidc.json")?;
 let request = rp.authorize()?;
-let who = rp.complete(&query, &request)?;
+let who = rp.complete_session(&query, &request, &session_id)?;
+let access = rp.session_access_token(&session_id)?;
 ```
 
-Keep the transaction (state, nonce, code verifier) until the browser returns. Tokens stay in this process.
+Keep the transaction (state, nonce, code verifier, acr_values) until the browser returns. Tokens stay in this process.
 
 ## Tests
 

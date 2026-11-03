@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
@@ -11,15 +11,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::b64::b64url_encode;
-use crate::config::read_config_file;
-use crate::value::JsonMap;
+use crate::config::{apply_defaults, check_redirect, read_config_file};
 use crate::discovery::{discover_provider, id_token_algorithms, scheme_of};
+use crate::dpop::{resource_wants_nonce, Dpop, DPOP_ALG};
 use crate::error::OidcError;
-use crate::http::send;
+use crate::http::{send, Answer};
+use crate::value::{string_list, JsonMap};
 use crate::idtoken::{validate_id_token, TokenChecks};
 use crate::keys::{load_private_key, sign_jws, PrivateKey};
 use crate::pkce::{code_challenge_s256, random_token};
-use crate::value::{as_f64, as_map, as_string_list, contains_str, is_exact_true, map_str, sprint};
+use crate::value::{as_f64, as_map, as_string_list, contains_str, is_exact_true, map_str};
 
 const FRONT: &[&str] = &["access_token", "id_token", "refresh_token", "token_type"];
 
@@ -125,7 +126,7 @@ fn with_query(base: &str, params: &HashMap<String, String>, order: &[String]) ->
 }
 
 /// The sign-in kept until the browser returns.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Transaction {
     pub state: String,
     pub nonce: String,
@@ -134,10 +135,12 @@ pub struct Transaction {
     pub url: String,
     pub max_age: Option<f64>,
     pub expected_sub: String,
+    /// The `acr_values` the request named (space-separated). The ID token's `acr` must be one of them.
+    pub acr_values: String,
 }
 
 /// A completed sign-in. Tokens stay in this process.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Login {
     pub subject: String,
     pub issuer: String,
@@ -152,7 +155,47 @@ pub struct Login {
     pub refresh_token: String,
     pub expires_at: Option<f64>,
     pub scope: String,
+    /// The session cache key (`complete_session`), or empty.
+    pub session_id: String,
 }
+
+impl Login {
+    /// The access token and its type, as a resource request needs them.
+    pub fn access(&self) -> Access {
+        Access { access_token: self.access_token.clone(), token_type: self.token_type.clone(), expires_at: self.expires_at, scope: self.scope.clone() }
+    }
+}
+
+/// Where completed sign-ins are kept, by a session identifier the application chooses.
+/// The default is `MemorySessionStore`; a store shared by several processes implements this.
+pub trait SessionStore: Send + Sync {
+    fn get(&self, session_id: &str) -> Option<Login>;
+    fn set(&self, session_id: &str, login: Login);
+    fn remove(&self, session_id: &str);
+}
+
+/// The default session store: this process's memory.
+#[derive(Default)]
+pub struct MemorySessionStore {
+    entries: Mutex<HashMap<String, Login>>,
+}
+
+impl SessionStore for MemorySessionStore {
+    fn get(&self, session_id: &str) -> Option<Login> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).get(session_id).cloned()
+    }
+
+    fn set(&self, session_id: &str, login: Login) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string(), login);
+    }
+
+    fn remove(&self, session_id: &str) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
+    }
+}
+
+/// A cached access token is used while it has more than this many seconds left.
+pub const SESSION_REFRESH_MARGIN_SEC: f64 = 30.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct AuthorizeOptions {
@@ -196,9 +239,13 @@ pub struct RelyingParty {
     metadata: JsonMap,
     key: Option<PrivateKey>,
     algs: Vec<String>,
+    dpop: Option<Dpop>,
+    require_typ_at_hash: bool,
     jwks: Mutex<Option<Vec<JsonMap>>>,
     used_codes: Mutex<HashMap<String, f64>>,
     cc: Mutex<Option<(String, Access, f64)>>,
+    sessions: RwLock<Arc<dyn SessionStore>>,
+    refreshing: Mutex<()>,
 }
 
 impl RelyingParty {
@@ -218,7 +265,11 @@ impl RelyingParty {
         Self::create(read_config_file(path)?)
     }
 
+    /// Builds a relying party from a configuration object. The defaults and the redirect
+    /// URI rule apply here exactly as they do to `from_file` (`apply_defaults`).
     pub fn create(config: JsonMap) -> Result<Self, OidcError> {
+        let mut config = config;
+        apply_defaults(&mut config)?;
         let method = map_str(&config, "tokenEndpointAuthMethod");
         if method == "private_key_jwt" && map_str(&config, "privateKeyPem").is_empty() {
             return Err(OidcError::new("config", "private_key_jwt needs a private key"));
@@ -274,17 +325,83 @@ impl RelyingParty {
             Some(load_private_key(&map_str(&config, "privateKeyPem"), &alg)?)
         };
         let pinned = map_str(&config, "idTokenSignedResponseAlg");
+        let allowed = string_list(config.get("idTokenSigningAlgs").unwrap_or(&Value::Null));
         let advertised = as_string_list(metadata.get("id_token_signing_alg_values_supported").unwrap_or(&Value::Null)).unwrap_or_default();
-        let algs = id_token_algorithms(&advertised, &pinned)?;
+        let algs = id_token_algorithms(&advertised, &pinned, &allowed)?;
+        let par_mode = map_str(&config, "par");
+        let par_endpoint = map_str(&metadata, "pushed_authorization_request_endpoint");
+        let par_required = metadata.get("require_pushed_authorization_requests").is_some_and(is_exact_true);
+        if par_required && par_mode == "never" {
+            return Err(OidcError::new("config", "par is never, and the provider requires pushed authorization requests"));
+        }
+        if par_endpoint.is_empty() && par_mode == "always" {
+            return Err(OidcError::new("discovery", "par is always, and the provider has no pushed authorization endpoint"));
+        }
+        if par_endpoint.is_empty() && par_required {
+            return Err(OidcError::new("discovery", "the provider requires pushed authorization requests and has no pushed authorization endpoint"));
+        }
+        let dpop = Self::dpop_key(&config, &metadata)?;
+        let require_typ_at_hash = !matches!(config.get("requireIdTokenTypAndAtHash"), Some(Value::Bool(false)));
         Ok(Self {
             config,
             metadata,
             key,
             algs,
+            dpop,
+            require_typ_at_hash,
             jwks: Mutex::new(None),
             used_codes: Mutex::new(HashMap::new()),
             cc: Mutex::new(None),
+            sessions: RwLock::new(Arc::new(MemorySessionStore::default())),
+            refreshing: Mutex::new(()),
         })
+    }
+
+    /// `dpop`: `auto` uses DPoP when the provider advertises ES256 in
+    /// `dpop_signing_alg_values_supported`, `always` requires that, `never` sends no proofs.
+    fn dpop_key(config: &JsonMap, metadata: &JsonMap) -> Result<Option<Dpop>, OidcError> {
+        let mode = map_str(config, "dpop");
+        let pem = map_str(config, "dpopKey");
+        let named = if pem.is_empty() { None } else { Some(Dpop::from_pem(&pem)?) };
+        if mode == "never" {
+            return Ok(None);
+        }
+        let advertised = metadata.get("dpop_signing_alg_values_supported").and_then(as_string_list);
+        let es256 = advertised.as_ref().is_some_and(|list| contains_str(list, DPOP_ALG));
+        if mode == "always" && advertised.is_none() {
+            return Err(OidcError::new("discovery", "dpop is always, and the provider does not advertise dpop_signing_alg_values_supported"));
+        }
+        if mode == "always" && !es256 {
+            return Err(OidcError::new("discovery", "dpop is always, and the provider does not advertise ES256 for DPoP"));
+        }
+        if !es256 {
+            return Ok(None);
+        }
+        Ok(Some(named.unwrap_or_else(Dpop::generate)))
+    }
+
+    /// True when this relying party sends DPoP proofs.
+    pub fn uses_dpop(&self) -> bool {
+        self.dpop.is_some()
+    }
+
+    /// The DPoP key's JWK thumbprint (`dpop_jkt`), when DPoP is in use.
+    pub fn dpop_jkt(&self) -> Option<String> {
+        self.dpop.as_ref().map(|d| d.jkt().to_string())
+    }
+
+    /// The ID token algorithms this relying party accepts.
+    pub fn id_token_algs(&self) -> &[String] {
+        &self.algs
+    }
+
+    /// Replaces the session store (`MemorySessionStore` by default).
+    pub fn set_session_store(&self, store: Arc<dyn SessionStore>) {
+        *self.sessions.write().unwrap_or_else(|e| e.into_inner()) = store;
+    }
+
+    fn store(&self) -> Arc<dyn SessionStore> {
+        Arc::clone(&self.sessions.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub fn authorize(&self) -> Result<Transaction, OidcError> {
@@ -292,7 +409,12 @@ impl RelyingParty {
     }
 
     pub fn authorize_options(&self, opts: AuthorizeOptions) -> Result<Transaction, OidcError> {
-        let redirect_uri = if opts.redirect_uri.is_empty() { map_str(&self.config, "redirectUri") } else { opts.redirect_uri };
+        let redirect_uri = if opts.redirect_uri.is_empty() {
+            map_str(&self.config, "redirectUri")
+        } else {
+            check_redirect(&opts.redirect_uri, "redirect_uri")?
+        };
+        let acr_values = if opts.acr_values.is_empty() { map_str(&self.config, "acrValues") } else { opts.acr_values.split_whitespace().collect::<Vec<_>>().join(" ") };
         let scope = if opts.scope.is_empty() { map_str(&self.config, "scopes") } else { opts.scope };
         let state = random_token();
         let nonce = random_token();
@@ -319,19 +441,27 @@ impl RelyingParty {
             params.insert("max_age".into(), trim_float(max_age));
             order.push("max_age".into());
         }
-        if !opts.acr_values.is_empty() {
-            params.insert("acr_values".into(), opts.acr_values);
+        if !acr_values.is_empty() {
+            params.insert("acr_values".into(), acr_values.clone());
             order.push("acr_values".into());
         }
-        let mut txn = Transaction { state, nonce, code_verifier: verifier, redirect_uri, url: String::new(), max_age: opts.max_age, expected_sub: opts.expected_sub };
+        if let Some(dpop) = &self.dpop {
+            params.insert("dpop_jkt".into(), dpop.jkt().to_string());
+            order.push("dpop_jkt".into());
+        }
+        let mut txn = Transaction { state, nonce, code_verifier: verifier, redirect_uri, url: String::new(), max_age: opts.max_age, expected_sub: opts.expected_sub, acr_values };
         let par_endpoint = map_str(&self.metadata, "pushed_authorization_request_endpoint");
         let mode = map_str(&self.config, "par");
-        let use_par = mode == "always" || (mode == "auto" && !par_endpoint.is_empty());
+        let required = self.metadata.get("require_pushed_authorization_requests").is_some_and(is_exact_true);
+        let use_par = mode == "always" || (mode == "auto" && (required || !par_endpoint.is_empty()));
+        if required && mode == "never" {
+            return Err(OidcError::new("config", "par is never, and the provider requires pushed authorization requests"));
+        }
         if mode == "always" && par_endpoint.is_empty() {
             return Err(OidcError::new("discovery", "par is always, and the provider has no pushed authorization endpoint"));
         }
         if use_par && !par_endpoint.is_empty() {
-            let pushed = self.post_form(&par_endpoint, params, order)?;
+            let (pushed, _) = self.post_form(&par_endpoint, params, order)?;
             let request_uri = pushed.get("request_uri").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if request_uri.is_empty() {
                 return Err(OidcError::new("protocol", "the pushed authorization response has no request_uri"));
@@ -389,6 +519,9 @@ impl RelyingParty {
         extra.access_token = tokens.access_token.clone();
         extra.code = code;
         extra.max_age = txn.max_age;
+        extra.require_typ = self.require_typ_at_hash;
+        extra.require_at_hash = self.require_typ_at_hash;
+        extra.acr_values = txn.acr_values.split_whitespace().map(str::to_string).collect();
         let claims = self.id_token(&tokens.id_token, extra)?;
         if !txn.expected_sub.is_empty() && map_str(&claims, "sub") != txn.expected_sub {
             return Err(OidcError::new("validation", "the provider signed in a different account from the one requested"));
@@ -419,6 +552,8 @@ impl RelyingParty {
             let mut extra = TokenChecks::default();
             extra.access_token = tokens.access_token.clone();
             extra.previous_sub = Some(previous.subject.clone());
+            extra.require_typ = self.require_typ_at_hash;
+            extra.require_at_hash = self.require_typ_at_hash;
             claims = Some(self.id_token(&tokens.id_token, extra)?);
             id_token = tokens.id_token.clone();
         }
@@ -450,7 +585,8 @@ impl RelyingParty {
         Ok(token)
     }
 
-    pub fn userinfo(&self, access_token: &str, expected_sub: &str) -> Result<JsonMap, OidcError> {
+    /// UserInfo with an access token of `token_type` (`Bearer`, or `DPoP` with a proof).
+    pub fn userinfo(&self, access_token: &str, token_type: &str, expected_sub: &str) -> Result<JsonMap, OidcError> {
         if expected_sub.is_empty() {
             return Err(OidcError::new("validation", "userinfo needs the subject to check the response against"));
         }
@@ -458,7 +594,8 @@ impl RelyingParty {
         if endpoint.is_empty() {
             return Err(OidcError::new("discovery", "the provider has no userinfo_endpoint"));
         }
-        let answer = send(&endpoint, "GET", &[("accept".into(), "application/json, application/jwt".into()), ("authorization".into(), format!("Bearer {access_token}"))], None, self.tls_ca(), "protocol")?;
+        let accept = [("accept".to_string(), "application/json, application/jwt".to_string())];
+        let answer = self.send_resource("GET", &endpoint, access_token, token_type, &accept, None, self.tls_ca(), "protocol")?;
         if answer.status == 401 {
             return Err(OidcError::oauth("protocol", "userinfo refused the access token", "invalid_token"));
         }
@@ -551,7 +688,7 @@ impl RelyingParty {
     }
 
     fn token(&self, body: HashMap<String, String>, order: Vec<String>) -> Result<TokenResponse, OidcError> {
-        let parsed = self.post_form(&map_str(&self.metadata, "token_endpoint"), body, order)?;
+        let (parsed, proof_sent) = self.post_form(&map_str(&self.metadata, "token_endpoint"), body, order)?;
         let access = parsed.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let token_type = parsed.get("token_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if access.is_empty() {
@@ -560,10 +697,15 @@ impl RelyingParty {
         if token_type.is_empty() {
             return Err(OidcError::new("protocol", "the token response has no token_type"));
         }
-        if token_type.eq_ignore_ascii_case("dpop") {
-            return Err(OidcError::new("protocol", "the provider returned a DPoP token; this client asked for a Bearer token"));
+        // RFC 9449 section 5: a proof was sent, so the token must be DPoP-bound; none was
+        // sent, so it must be a Bearer token.
+        if proof_sent && !token_type.eq_ignore_ascii_case("dpop") {
+            return Err(OidcError::new("protocol", format!("this client sent a DPoP proof and the provider returned token_type {token_type}, not DPoP")));
         }
-        if !token_type.eq_ignore_ascii_case("bearer") {
+        if !proof_sent && token_type.eq_ignore_ascii_case("dpop") {
+            return Err(OidcError::new("protocol", "the provider returned a DPoP token; this client sent no DPoP proof and asked for a Bearer token"));
+        }
+        if !proof_sent && !token_type.eq_ignore_ascii_case("bearer") {
             return Err(OidcError::new("protocol", format!("the token response token_type is {token_type}")));
         }
         Ok(TokenResponse {
@@ -576,37 +718,146 @@ impl RelyingParty {
         })
     }
 
-    fn post_form(&self, endpoint: &str, mut body: HashMap<String, String>, mut order: Vec<String>) -> Result<JsonMap, OidcError> {
-        let mut headers = vec![("accept".into(), "application/json".into()), ("content-type".into(), "application/x-www-form-urlencoded".into())];
-        apply_client_auth(&self.config, self.key.as_ref(), &mut body, &mut headers, &map_str(&self.metadata, "issuer"))?;
+    /// A form POST to the authorization server (PAR or token endpoint), with a DPoP proof
+    /// when DPoP is in use. A 400 `use_dpop_nonce` is retried once with the nonce it gave.
+    /// Returns the JSON answer and whether a proof was sent.
+    fn post_form(&self, endpoint: &str, body: HashMap<String, String>, mut order: Vec<String>) -> Result<(JsonMap, bool), OidcError> {
         for key in body.keys() {
             if !order.iter().any(|item| item == key) {
                 order.push(key.clone());
             }
         }
-        let encoded = form_body(&body, &order);
-        let answer = send(endpoint, "POST", &headers, Some(&encoded), self.tls_ca(), "protocol")?;
-        let parsed: Value = if answer.body.is_empty() {
-            Value::Object(JsonMap::new())
-        } else {
-            serde_json::from_str(&answer.body).map_err(|err| OidcError::new("protocol", format!("{endpoint} answered {} with no JSON: {err}", answer.status)))?
-        };
-        let doc = as_map(&parsed).cloned().unwrap_or_default();
-        if answer.status != 200 && answer.status != 201 {
-            let oauth = doc.get("error").and_then(|v| v.as_str()).unwrap_or("");
-            let description = doc.get("error_description").and_then(|v| v.as_str()).unwrap_or("");
-            let mut message = format!("{endpoint} answered {}", answer.status);
-            if !oauth.is_empty() {
-                message.push_str(": ");
-                message.push_str(oauth);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut fields = body.clone();
+            let mut headers = vec![("accept".into(), "application/json".into()), ("content-type".into(), "application/x-www-form-urlencoded".into())];
+            // A fresh client assertion (and jti) on every attempt.
+            apply_client_auth(&self.config, self.key.as_ref(), &mut fields, &mut headers, &map_str(&self.metadata, "issuer"))?;
+            if let Some(dpop) = &self.dpop {
+                headers.push(("dpop".into(), dpop.proof("POST", endpoint, None)?));
             }
-            if !description.is_empty() {
-                message.push_str(": ");
-                message.push_str(description);
+            let mut field_order = order.clone();
+            for key in fields.keys() {
+                if !field_order.iter().any(|item| item == key) {
+                    field_order.push(key.clone());
+                }
             }
-            return Err(OidcError::oauth("protocol", message, oauth));
+            let encoded = form_body(&fields, &field_order);
+            let answer = send(endpoint, "POST", &headers, Some(&encoded), self.tls_ca(), "protocol")?;
+            if let Some(dpop) = &self.dpop {
+                dpop.remember_nonce(endpoint, &answer.dpop_nonce);
+            }
+            let parsed: Value = if answer.body.is_empty() {
+                Value::Object(JsonMap::new())
+            } else {
+                serde_json::from_str(&answer.body).map_err(|err| OidcError::new("protocol", format!("{endpoint} answered {} with no JSON: {err}", answer.status)))?
+            };
+            let doc = as_map(&parsed).cloned().unwrap_or_default();
+            if answer.status != 200 && answer.status != 201 {
+                let oauth = doc.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                if self.dpop.is_some() && answer.status == 400 && oauth == "use_dpop_nonce" && attempt == 1 && !answer.dpop_nonce.is_empty() {
+                    continue;
+                }
+                let description = doc.get("error_description").and_then(|v| v.as_str()).unwrap_or("");
+                let mut message = format!("{endpoint} answered {}", answer.status);
+                if !oauth.is_empty() {
+                    message.push_str(": ");
+                    message.push_str(oauth);
+                }
+                if !description.is_empty() {
+                    message.push_str(": ");
+                    message.push_str(description);
+                }
+                return Err(OidcError::oauth("protocol", message, oauth));
+            }
+            return Ok((doc, self.dpop.is_some()));
         }
-        Ok(doc)
+    }
+
+    /// The `Authorization` header (and `DPoP` proof, with `ath`) for a resource request
+    /// made with an access token of `token_type`.
+    pub fn resource_headers(&self, method: &str, url: &str, access_token: &str, token_type: &str) -> Result<Vec<(String, String)>, OidcError> {
+        if token_type.eq_ignore_ascii_case("dpop") {
+            let dpop = self.dpop.as_ref().ok_or_else(|| OidcError::new("protocol", "this access token is DPoP-bound and this client holds no DPoP key"))?;
+            return Ok(vec![("authorization".into(), format!("DPoP {access_token}")), ("dpop".into(), dpop.proof(method, url, Some(access_token))?)]);
+        }
+        Ok(vec![("authorization".into(), format!("Bearer {access_token}"))])
+    }
+
+    /// A resource request. With a DPoP-bound token, a 401 carrying
+    /// `WWW-Authenticate: DPoP error="use_dpop_nonce"` is retried once with the nonce it gave.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_resource(&self, method: &str, url: &str, access_token: &str, token_type: &str, extra: &[(String, String)], body: Option<&str>, ca: Option<&str>, code: &str) -> Result<Answer, OidcError> {
+        let bound = token_type.eq_ignore_ascii_case("dpop");
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut headers = extra.to_vec();
+            headers.extend(self.resource_headers(method, url, access_token, token_type)?);
+            let answer = send(url, method, &headers, body, ca, code)?;
+            if bound {
+                if let Some(dpop) = &self.dpop {
+                    dpop.remember_nonce(url, &answer.dpop_nonce);
+                }
+                if attempt == 1 && resource_wants_nonce(answer.status, &answer.www_authenticate) && !answer.dpop_nonce.is_empty() {
+                    continue;
+                }
+            }
+            return Ok(answer);
+        }
+    }
+
+    /// `complete`, and the tokens kept in the session cache under `session_id`
+    /// (a new random handle when it is empty, returned as `Login::session_id`).
+    pub fn complete_session(&self, query: &HashMap<String, String>, txn: &Transaction, session_id: &str) -> Result<Login, OidcError> {
+        let mut login = self.complete(query, txn)?;
+        login.session_id = if session_id.is_empty() { random_token() } else { session_id.to_string() };
+        self.store().set(&login.session_id, login.clone());
+        Ok(login)
+    }
+
+    /// The cached sign-in of a session, if any.
+    pub fn session(&self, session_id: &str) -> Option<Login> {
+        self.store().get(session_id)
+    }
+
+    /// A valid access token for a session: the cached one while it has more than 30
+    /// seconds left, otherwise one obtained with the refresh token (with a DPoP proof when
+    /// DPoP is in use), and the cache is updated. A failed refresh removes the entry.
+    pub fn session_access_token(&self, session_id: &str) -> Result<Access, OidcError> {
+        let store = self.store();
+        let fresh = |login: &Login| login.expires_at.map_or(true, |at| at - now_sec() > SESSION_REFRESH_MARGIN_SEC);
+        let login = store.get(session_id).ok_or_else(|| OidcError::new("protocol", "there is no cached sign-in for this session"))?;
+        if fresh(&login) {
+            return Ok(login.access());
+        }
+        let _one = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        // Another caller may have refreshed while this one waited.
+        let login = store.get(session_id).ok_or_else(|| OidcError::new("protocol", "there is no cached sign-in for this session"))?;
+        if fresh(&login) {
+            return Ok(login.access());
+        }
+        if login.refresh_token.is_empty() {
+            store.remove(session_id);
+            return Err(OidcError::new("protocol", "the session's access token has expired and there is no refresh token"));
+        }
+        match self.refresh(&login.refresh_token, "", Some(&login)) {
+            Ok(mut refreshed) => {
+                refreshed.session_id = session_id.to_string();
+                store.set(session_id, refreshed.clone());
+                Ok(refreshed.access())
+            }
+            Err(err) => {
+                store.remove(session_id);
+                Err(OidcError::oauth(&err.code, format!("the session's refresh was refused: {}", err.message), &err.oauth_error))
+            }
+        }
+    }
+
+    /// Clears a session's cached tokens (sign-out, a CAEP session-revoked).
+    pub fn remove_session(&self, session_id: &str) {
+        self.store().remove(session_id);
     }
 
     fn remember_code(&self, code: &str) -> Result<(), OidcError> {
@@ -657,6 +908,7 @@ fn login_from(tokens: TokenResponse, claims: JsonMap) -> Login {
         refresh_token: tokens.refresh_token,
         expires_at,
         scope: tokens.scope,
+        session_id: String::new(),
     }
 }
 
