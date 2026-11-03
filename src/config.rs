@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Number, Value};
 
-use crate::discovery::{issuer_from_metadata_url, validate_provider_metadata, DEFAULT_SCOPES};
+use crate::discovery::{check_id_token_alg, issuer_from_metadata_url, validate_provider_metadata, DEFAULT_SCOPES};
 use crate::error::OidcError;
 use crate::value::{as_f64, as_map, as_string_list, is_exact_true, map_str, sprint, truthy, JsonMap};
 
@@ -76,16 +76,19 @@ fn signals_on(value: Option<&Value>) -> Result<bool, OidcError> {
     }
 }
 
-fn is_loopback(hostname: &str) -> bool {
+/// `localhost`, `127.0.0.1`, or `[::1]`.
+pub fn is_loopback(hostname: &str) -> bool {
     matches!(hostname, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
-fn check_redirect(value: &str, name: &str, allow_insecure: bool) -> Result<String, OidcError> {
+/// A redirect URI is https, or http on a loopback host (`localhost`, `127.0.0.1`, `[::1]`).
+/// `allowInsecure` does not relax this; it is for a development provider's endpoints.
+pub fn check_redirect(value: &str, name: &str) -> Result<String, OidcError> {
     let parts = url::Url::parse(value).map_err(|_| OidcError::new("config", format!("{name} is not a URL: {value}")))?;
     if parts.scheme() != "http" && parts.scheme() != "https" || parts.host_str().is_none() {
         return Err(OidcError::new("config", format!("{name} is not a URL: {value}")));
     }
-    if parts.scheme() == "https" || (parts.scheme() == "http" && (is_loopback(parts.host_str().unwrap_or("")) || allow_insecure)) {
+    if parts.scheme() == "https" || (parts.scheme() == "http" && is_loopback(parts.host_str().unwrap_or(""))) {
         return Ok(value.to_string());
     }
     Err(OidcError::new("config", format!("{name} must use https, or http on loopback: {value}")))
@@ -138,13 +141,6 @@ pub fn resolve_config(raw: &JsonMap, base_dir: &str) -> Result<Resolved, OidcErr
     if !scopes.split_whitespace().any(|part| part == "openid") {
         return Err(OidcError::new("config", "scopes must include openid"));
     }
-    let mut par = raw.get("par").filter(|v| !v.is_null()).map(sprint).unwrap_or_else(|| "auto".to_string());
-    if par.is_empty() {
-        par = "auto".to_string();
-    }
-    if par != "auto" && par != "always" && par != "never" {
-        return Err(OidcError::new("config", "par must be auto, always, or never"));
-    }
     let mut issuer = raw.get("issuer").filter(|v| !v.is_null()).map(|v| sprint(v).trim().to_string()).unwrap_or_default();
     if issuer.is_empty() {
         issuer.clear();
@@ -187,6 +183,11 @@ pub fn resolve_config(raw: &JsonMap, base_dir: &str) -> Result<Resolved, OidcErr
     if method == "private_key_jwt" && private_key.is_empty() {
         return Err(OidcError::new("config", "private_key_jwt needs privateKey"));
     }
+    let dpop_key = if let Some(value) = raw.get("dpopKey").filter(|v| !v.is_null()).map(sprint).filter(|v| !v.is_empty()) {
+        Some(key_value(&value, base_dir, "the DPoP key")?)
+    } else {
+        None
+    };
     let tls_ca = read_trust(raw.get("tlsCa"), base_dir);
     let post = first_string(raw, &["postLogoutRedirectUri", "post_logout_redirect_uri"]).trim().to_string();
     let mut ssf = None;
@@ -206,7 +207,7 @@ pub fn resolve_config(raw: &JsonMap, base_dir: &str) -> Result<Resolved, OidcErr
             }
         }
     }
-    let checked_redirect = check_redirect(&redirect_uri, "redirectUri", allow_insecure)?;
+    let checked_redirect = check_redirect(&redirect_uri, "redirectUri")?;
     let mut out = JsonMap::new();
     if !issuer.is_empty() {
         out.insert("issuer".into(), Value::String(issuer));
@@ -232,17 +233,20 @@ pub fn resolve_config(raw: &JsonMap, base_dir: &str) -> Result<Resolved, OidcErr
     out.insert("tokenEndpointAuthMethod".into(), Value::String(method));
     out.insert("redirectUri".into(), Value::String(checked_redirect));
     if !post.is_empty() {
-        out.insert("postLogoutRedirectUri".into(), Value::String(check_redirect(&post, "postLogoutRedirectUri", allow_insecure)?));
+        out.insert("postLogoutRedirectUri".into(), Value::String(check_redirect(&post, "postLogoutRedirectUri")?));
     }
     out.insert("scopes".into(), Value::String(scopes));
     if let Some(alg) = raw.get("idTokenSignedResponseAlg").filter(|v| !v.is_null()).map(sprint).filter(|v| !v.is_empty()) {
         out.insert("idTokenSignedResponseAlg".into(), Value::String(alg));
     }
-    out.insert("par".into(), Value::String(par));
-    let clock = raw.get("clockToleranceSec").filter(|v| !v.is_null()).cloned().unwrap_or(Value::Number(Number::from(30)));
-    let max_age = raw.get("maxIdTokenAgeSec").filter(|v| !v.is_null()).cloned().unwrap_or(Value::Number(Number::from(600)));
-    out.insert("clockToleranceSec".into(), clock);
-    out.insert("maxIdTokenAgeSec".into(), max_age);
+    for key in ["par", "dpop", "idTokenSigningAlgs", "requireIdTokenTypAndAtHash", "acrValues", "clockToleranceSec", "maxIdTokenAgeSec"] {
+        if let Some(value) = raw.get(key).filter(|v| !v.is_null()) {
+            out.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(dpop_key) = dpop_key {
+        out.insert("dpopKey".into(), Value::String(dpop_key));
+    }
     out.insert("allowInsecure".into(), Value::Bool(allow_insecure));
     if let Some(tls_ca) = tls_ca {
         out.insert("tlsCa".into(), Value::String(tls_ca));
@@ -253,8 +257,99 @@ pub fn resolve_config(raw: &JsonMap, base_dir: &str) -> Result<Resolved, OidcErr
     if let Some(ssf) = ssf {
         out.insert("ssf".into(), Value::Object(ssf));
     }
-    let _ = as_f64;
+    apply_defaults(&mut out)?;
     Ok(out)
+}
+
+fn mode(config: &mut JsonMap, key: &str) -> Result<(), OidcError> {
+    let value = config.get(key).filter(|v| !v.is_null()).map(sprint).unwrap_or_default();
+    let value = if value.is_empty() { "auto".to_string() } else { value };
+    if value != "auto" && value != "always" && value != "never" {
+        return Err(OidcError::new("config", format!("{key} must be auto, always, or never")));
+    }
+    config.insert(key.into(), Value::String(value));
+    Ok(())
+}
+
+fn seconds(config: &mut JsonMap, key: &str, default: i64) -> Result<(), OidcError> {
+    match config.get(key).filter(|v| !v.is_null()) {
+        None => {
+            config.insert(key.into(), Value::Number(Number::from(default)));
+            Ok(())
+        }
+        Some(value) => match as_f64(value) {
+            Some(n) if n >= 0.0 && n.is_finite() => Ok(()),
+            _ => Err(OidcError::new("config", format!("{key} must be a number of seconds, 0 or more"))),
+        },
+    }
+}
+
+fn words(value: &Value) -> Option<Vec<String>> {
+    if let Some(list) = as_string_list(value) {
+        return Some(list.into_iter().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect());
+    }
+    value.as_str().map(|text| text.split(|c: char| c.is_whitespace() || c == ',').filter(|v| !v.is_empty()).map(str::to_string).collect())
+}
+
+/// The defaults and checks every relying party gets, whether its configuration came
+/// from a file (`resolve_config`) or was handed to `RelyingParty::create` directly:
+/// `par` and `dpop` (auto), `clockToleranceSec` (30), `maxIdTokenAgeSec` (600),
+/// `idTokenSigningAlgs` (`["RS256"]`), `requireIdTokenTypAndAtHash` (true), and the
+/// redirect URI rule (https, or http on `localhost`, `127.0.0.1`, or `[::1]`).
+pub fn apply_defaults(config: &mut JsonMap) -> Result<(), OidcError> {
+    mode(config, "par")?;
+    mode(config, "dpop")?;
+    seconds(config, "clockToleranceSec", 30)?;
+    seconds(config, "maxIdTokenAgeSec", 600)?;
+    let algs = match config.get("idTokenSigningAlgs").filter(|v| !v.is_null()) {
+        None => vec!["RS256".to_string()],
+        Some(value) => words(value).ok_or_else(|| OidcError::new("config", "idTokenSigningAlgs must be a list of algorithm names"))?,
+    };
+    if algs.is_empty() {
+        return Err(OidcError::new("config", "idTokenSigningAlgs must name at least one algorithm"));
+    }
+    for alg in &algs {
+        check_id_token_alg(alg)?;
+    }
+    config.insert("idTokenSigningAlgs".into(), Value::Array(algs.into_iter().map(Value::String).collect()));
+    if let Some(alg) = config.get("idTokenSignedResponseAlg").filter(|v| !v.is_null()).map(sprint).filter(|v| !v.is_empty()) {
+        check_id_token_alg(&alg)?;
+    }
+    match config.get("requireIdTokenTypAndAtHash").filter(|v| !v.is_null()) {
+        None => {
+            config.insert("requireIdTokenTypAndAtHash".into(), Value::Bool(true));
+        }
+        Some(Value::Bool(_)) => {}
+        Some(_) => return Err(OidcError::new("config", "requireIdTokenTypAndAtHash must be true or false")),
+    }
+    if let Some(value) = config.get("acrValues").filter(|v| !v.is_null()).cloned() {
+        let list = words(&value).ok_or_else(|| OidcError::new("config", "acrValues must be a string or a list of strings"))?;
+        if list.is_empty() {
+            config.remove("acrValues");
+        } else {
+            config.insert("acrValues".into(), Value::String(list.join(" ")));
+        }
+    }
+    if let Some(raw) = config.get("dpopKey").filter(|v| !v.is_null()).map(sprint).filter(|v| !v.is_empty()) {
+        if !raw.contains("-----BEGIN") {
+            let pem = key_value(&raw, ".", "the DPoP key")?;
+            config.insert("dpopKey".into(), Value::String(pem));
+        }
+    }
+    let redirect = first_string(config, &["redirectUri", "redirect_uri"]).trim().to_string();
+    if redirect.is_empty() {
+        return Err(OidcError::new("config", "redirectUri is required"));
+    }
+    config.remove("redirect_uri");
+    config.insert("redirectUri".into(), Value::String(check_redirect(&redirect, "redirectUri")?));
+    let post = first_string(config, &["postLogoutRedirectUri", "post_logout_redirect_uri"]).trim().to_string();
+    config.remove("post_logout_redirect_uri");
+    if post.is_empty() {
+        config.remove("postLogoutRedirectUri");
+    } else {
+        config.insert("postLogoutRedirectUri".into(), Value::String(check_redirect(&post, "postLogoutRedirectUri")?));
+    }
+    Ok(())
 }
 
 pub fn read_config_file(path: &str) -> Result<Resolved, OidcError> {

@@ -12,6 +12,10 @@ pub struct Answer {
     pub status: u16,
     pub content_type: String,
     pub body: String,
+    /// The `DPoP-Nonce` response header, or empty.
+    pub dpop_nonce: String,
+    /// The `WWW-Authenticate` response header, or empty.
+    pub www_authenticate: String,
 }
 
 /// Back-channel HTTP. Redirects are not followed. The process proxy environment is ignored.
@@ -45,6 +49,8 @@ pub fn send(raw_url: &str, method: &str, headers: &[(String, String)], body: Opt
     };
     let status = response.status();
     let content_type = response.header("content-type").unwrap_or("").to_string();
+    let dpop_nonce = response.header("dpop-nonce").unwrap_or("").to_string();
+    let www_authenticate = response.all("www-authenticate").join(", ");
     let mut buf = Vec::new();
     let mut reader = response.into_reader().take(MAX_BODY as u64 + 1);
     reader.read_to_end(&mut buf).map_err(|err| OidcError::new(code, format!("{raw_url}: {err}")))?;
@@ -52,7 +58,7 @@ pub fn send(raw_url: &str, method: &str, headers: &[(String, String)], body: Opt
         return Err(OidcError::new(code, format!("{raw_url} answered more than {MAX_BODY} bytes")));
     }
     let body = String::from_utf8_lossy(&buf).into_owned();
-    Ok(Answer { status, content_type, body })
+    Ok(Answer { status, content_type, body, dpop_nonce, www_authenticate })
 }
 
 fn agent(ca: Option<&str>, code: &str) -> Result<ureq::Agent, OidcError> {

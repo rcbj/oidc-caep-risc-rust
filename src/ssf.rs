@@ -12,7 +12,8 @@ use crate::b64::b64url_decode;
 use crate::discovery::well_known_urls;
 use crate::error::OidcError;
 use crate::http::send;
-use crate::keys::{public_key_from_jwk, verify_signature, SUPPORTED_JWS};
+use crate::rp::RelyingParty;
+use crate::keys::{kty_for, public_key_from_jwk, verify_signature, SUPPORTED_JWS};
 use crate::value::{as_f64, as_map, as_map_owned, as_string_list, clip, contains_str, is_exact_true, json_compact, map_str, sprint, JsonMap};
 
 const POLL_METHOD: &str = "urn:ietf:rfc:8936";
@@ -169,8 +170,7 @@ pub fn verify_compact_jws(token: &str, keys: &[JsonMap]) -> Result<(JsonMap, Jso
     let header = as_map_owned(header_val).ok_or_else(|| OidcError::new("signature", "the SET's header or payload is not a JSON object"))?;
     let payload = as_map_owned(payload_val).ok_or_else(|| OidcError::new("signature", "the SET's header or payload is not a JSON object"))?;
     let alg = map_str(&header, "alg");
-    let known = matches!(alg.as_str(), "RS256" | "RS384" | "RS512");
-    if !known {
+    if !SUPPORTED_JWS.contains(&alg.as_str()) {
         let shown = if alg.is_empty() { "(no alg)" } else { alg.as_str() };
         return Err(OidcError::new("signature", format!("the SET is signed with {shown}, which this receiver does not verify ({})", SUPPORTED_JWS.join(", "))));
     }
@@ -178,10 +178,11 @@ pub fn verify_compact_jws(token: &str, keys: &[JsonMap]) -> Result<(JsonMap, Jso
         return Err(OidcError::new("signature", "the SET's header has a crit member this receiver does not understand"));
     }
     let kid = header.get("kid").and_then(|v| v.as_str()).unwrap_or("");
+    let kty = kty_for(&alg).unwrap_or("RSA");
     let matched: Vec<&JsonMap> = keys
         .iter()
         .filter(|jwk| kid.is_empty() || map_str(jwk, "kid") == kid)
-        .filter(|jwk| map_str(jwk, "kty") == "RSA")
+        .filter(|jwk| map_str(jwk, "kty") == kty)
         .filter(|jwk| {
             let use_ = jwk.get("use").map(sprint).unwrap_or_default();
             use_.is_empty() || use_ == "sig"
@@ -193,7 +194,7 @@ pub fn verify_compact_jws(token: &str, keys: &[JsonMap]) -> Result<(JsonMap, Jso
         .collect();
     if matched.is_empty() {
         let suffix = if kid.is_empty() { String::new() } else { format!(" with kid {kid}") };
-        return Err(OidcError::new("signature", format!("the transmitter publishes no RSA signing key{suffix}")));
+        return Err(OidcError::new("signature", format!("the transmitter publishes no {kty} signing key{suffix}")));
     }
     let signature = b64url_decode(parts[2], "signature").map_err(|err| OidcError::new("signature", format!("the SET's signature is not base64url: {err}")))?;
     let data = format!("{}.{}", parts[0], parts[1]);
@@ -301,7 +302,14 @@ pub struct SignalEvent {
 
 pub struct ReceiverOptions {
     pub tls_ca: Option<String>,
+    /// Extra headers for every transmitter call. Not needed with `relying_party`.
     pub headers: Option<Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>>,
+    /// Authorizes every transmitter call with this relying party's client-credentials
+    /// token for `scope` (`ssf.manage` by default), with a DPoP proof (and `ath`) when the
+    /// token is DPoP-bound, retrying once on `use_dpop_nonce`. A session the receiver ends
+    /// is also removed from its session cache.
+    pub relying_party: Option<Arc<RelyingParty>>,
+    pub scope: String,
     pub events_requested: Vec<String>,
     pub end_on: Vec<String>,
     pub description: String,
@@ -311,7 +319,7 @@ pub struct ReceiverOptions {
 
 impl Default for ReceiverOptions {
     fn default() -> Self {
-        Self { tls_ca: None, headers: None, events_requested: Vec::new(), end_on: Vec::new(), description: String::new(), poll_interval_ms: 0, max_events: 0 }
+        Self { tls_ca: None, headers: None, relying_party: None, scope: String::new(), events_requested: Vec::new(), end_on: Vec::new(), description: String::new(), poll_interval_ms: 0, max_events: 0 }
     }
 }
 
@@ -334,6 +342,8 @@ pub struct SignalsReceiver {
     on_end: Arc<dyn Fn(Vec<String>, SignalEvent) + Send + Sync>,
     tls_ca: Option<String>,
     headers: Option<Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>>,
+    relying_party: Option<Arc<RelyingParty>>,
+    scope: String,
     events_requested: Vec<String>,
     end_on: Vec<String>,
     description: String,
@@ -359,6 +369,8 @@ impl SignalsReceiver {
             on_end,
             tls_ca: opts.tls_ca,
             headers: opts.headers,
+            relying_party: opts.relying_party,
+            scope: if opts.scope.is_empty() { "ssf.manage".to_string() } else { opts.scope },
             events_requested: events,
             end_on,
             description: opts.description,
@@ -463,6 +475,8 @@ impl SignalsReceiver {
             on_end: Arc::clone(&self.on_end),
             tls_ca: self.tls_ca.clone(),
             headers: self.headers.clone(),
+            relying_party: self.relying_party.clone(),
+            scope: self.scope.clone(),
             end_on: self.end_on.clone(),
             poll_ms: self.poll_ms,
             max_events: self.max_events,
@@ -477,6 +491,8 @@ struct Worker {
     on_end: Arc<dyn Fn(Vec<String>, SignalEvent) + Send + Sync>,
     tls_ca: Option<String>,
     headers: Option<Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>>,
+    relying_party: Option<Arc<RelyingParty>>,
+    scope: String,
     end_on: Vec<String>,
     poll_ms: i64,
     max_events: i64,
@@ -553,6 +569,8 @@ impl Worker {
             on_end: Arc::clone(&self.on_end),
             tls_ca: self.tls_ca.clone(),
             headers: self.headers.clone(),
+            relying_party: self.relying_party.clone(),
+            scope: self.scope.clone(),
             end_on: self.end_on.clone(),
             poll_ms: self.poll_ms,
             max_events: self.max_events,
@@ -687,6 +705,11 @@ impl Worker {
                 txn: payload.get("txn").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             };
             if ended {
+                if let Some(rp) = &self.relying_party {
+                    for local_id in &sessions {
+                        rp.remove_session(local_id);
+                    }
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.on_end)(sessions.clone(), event.clone())));
                 if result.is_err() {
                     eprintln!("ssf: onEndSessions threw for {event_type} (SET {jti} is still acknowledged)");
@@ -779,21 +802,40 @@ impl Worker {
     }
 
     fn call(&self, method: &str, raw_url: &str, body: Option<&Value>) -> Result<(u16, Value, String), OidcError> {
-        let mut headers = vec![("accept".into(), "application/json".into())];
-        if let Some(extra) = &self.headers {
-            headers.extend(extra());
-        }
-        let payload = if let Some(body) = body {
-            let text = serde_json::to_string(body).map_err(|err| OidcError::new("ssf", err.to_string()))?;
-            headers.push(("content-type".into(), "application/json".into()));
-            Some(text)
-        } else {
-            None
-        };
-        let answer = send(raw_url, method, &headers, payload.as_deref(), self.tls_ca.as_deref(), "ssf")?;
-        let parsed = if answer.body.is_empty() { Value::Null } else { serde_json::from_str(&answer.body).unwrap_or(Value::String(answer.body.clone())) };
-        Ok((answer.status, parsed, answer.body))
+        transmitter_call(self.relying_party.as_deref(), &self.scope, self.headers.as_ref(), self.tls_ca.as_deref(), method, raw_url, body)
     }
+}
+
+/// One call to the transmitter. With a relying party, the call carries its
+/// client-credentials token (and a DPoP proof when that token is DPoP-bound).
+fn transmitter_call(
+    rp: Option<&RelyingParty>,
+    scope: &str,
+    extra: Option<&Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>>,
+    ca: Option<&str>,
+    method: &str,
+    raw_url: &str,
+    body: Option<&Value>,
+) -> Result<(u16, Value, String), OidcError> {
+    let mut headers = vec![("accept".into(), "application/json".into())];
+    if let Some(extra) = extra {
+        headers.extend(extra());
+    }
+    let payload = if let Some(body) = body {
+        let text = serde_json::to_string(body).map_err(|err| OidcError::new("ssf", err.to_string()))?;
+        headers.push(("content-type".into(), "application/json".into()));
+        Some(text)
+    } else {
+        None
+    };
+    let answer = if let Some(rp) = rp {
+        let access = rp.client_credentials(scope).map_err(|err| OidcError::new("ssf", format!("no access token for the transmitter: {err}")))?;
+        rp.send_resource(method, raw_url, &access.access_token, &access.token_type, &headers, payload.as_deref(), ca, "ssf")?
+    } else {
+        send(raw_url, method, &headers, payload.as_deref(), ca, "ssf")?
+    };
+    let parsed = if answer.body.is_empty() { Value::Null } else { serde_json::from_str(&answer.body).unwrap_or(Value::String(answer.body.clone())) };
+    Ok((answer.status, parsed, answer.body))
 }
 
 impl OidcError {
@@ -804,24 +846,7 @@ impl OidcError {
 
 impl SignalsReceiver {
     fn call(&self, method: &str, raw_url: &str, body: Option<&Value>) -> Result<(u16, Value, String), OidcError> {
-        let mut headers = vec![("accept".into(), "application/json".into())];
-        if let Some(extra) = &self.headers {
-            headers.extend(extra());
-        }
-        let payload = if let Some(body) = body {
-            let text = serde_json::to_string(body).map_err(|err| OidcError::new("ssf", err.to_string()))?;
-            headers.push(("content-type".into(), "application/json".into()));
-            Some(text)
-        } else {
-            None
-        };
-        let answer = send(raw_url, method, &headers, payload.as_deref(), self.tls_ca.as_deref(), "ssf")?;
-        let parsed = if answer.body.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&answer.body).unwrap_or(Value::String(answer.body.clone()))
-        };
-        Ok((answer.status, parsed, answer.body))
+        transmitter_call(self.relying_party.as_deref(), &self.scope, self.headers.as_ref(), self.tls_ca.as_deref(), method, raw_url, body)
     }
 
     fn discover(&self) -> Result<JsonMap, OidcError> {

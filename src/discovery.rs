@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::error::OidcError;
 use crate::http::send;
-use crate::keys::ASYMMETRIC;
+use crate::keys::{ASYMMETRIC, SYMMETRIC};
 use crate::value::{as_map_owned, as_string_list, contains_str, is_exact_true, JsonMap};
 
 pub const DEFAULT_SCOPES: &str = "openid profile email offline_access ssf.read ssf.manage";
@@ -65,14 +65,16 @@ pub fn validate_provider_metadata(raw: &JsonMap, expected_issuer: &str) -> Resul
             metadata.insert(key.to_string(), Value::String(must_be_url(value, key)?));
         }
     }
-    for key in ["token_endpoint_auth_methods_supported", "code_challenge_methods_supported", "scopes_supported", "grant_types_supported"] {
+    for key in ["token_endpoint_auth_methods_supported", "code_challenge_methods_supported", "scopes_supported", "grant_types_supported", "dpop_signing_alg_values_supported"] {
         if let Some(value) = raw.get(key).filter(|v| !v.is_null()) {
             let list = as_string_list(value).ok_or_else(|| OidcError::new("discovery", format!("{key} must be an array")))?;
             metadata.insert(key.to_string(), Value::Array(list.into_iter().map(Value::String).collect()));
         }
     }
-    if let Some(value) = raw.get("authorization_response_iss_parameter_supported").filter(|v| !v.is_null()) {
-        metadata.insert("authorization_response_iss_parameter_supported".to_string(), Value::Bool(is_exact_true(value)));
+    for key in ["authorization_response_iss_parameter_supported", "require_pushed_authorization_requests"] {
+        if let Some(value) = raw.get(key).filter(|v| !v.is_null()) {
+            metadata.insert(key.to_string(), Value::Bool(is_exact_true(value)));
+        }
     }
     let response_types = as_string_list(raw.get("response_types_supported").unwrap_or(&Value::Null)).unwrap_or_default();
     if !contains_str(&response_types, "code") {
@@ -119,18 +121,40 @@ pub fn well_known_urls(issuer: &str, suffix: &str) -> Vec<String> {
     }
 }
 
-pub fn id_token_algorithms(advertised: &[String], pinned: &str) -> Result<Vec<String>, OidcError> {
-    if !pinned.is_empty() {
-        if !contains_str(advertised, pinned) {
-            return Err(OidcError::new("discovery", format!("the provider does not advertise id_token alg {pinned}")));
-        }
-        return Ok(vec![pinned.to_string()]);
+/// The ID token algorithms this client accepts. `pinned` (`idTokenSignedResponseAlg`)
+/// names one; otherwise `allowed` (`idTokenSigningAlgs`, default `["RS256"]`). An
+/// algorithm is accepted only when the provider also advertises it. `none` is never
+/// accepted, and an HMAC algorithm only because the application named it.
+pub fn id_token_algorithms(advertised: &[String], pinned: &str, allowed: &[String]) -> Result<Vec<String>, OidcError> {
+    let wanted: Vec<String> = if !pinned.is_empty() {
+        vec![pinned.to_string()]
+    } else if allowed.is_empty() {
+        vec!["RS256".to_string()]
+    } else {
+        allowed.to_vec()
+    };
+    for alg in &wanted {
+        check_id_token_alg(alg)?;
     }
-    let allowed: Vec<String> = advertised.iter().filter(|alg| ASYMMETRIC.contains(&alg.as_str())).cloned().collect();
-    if allowed.is_empty() {
-        return Err(OidcError::new("discovery", format!("none of the provider's ID token algorithms can be verified ({})", advertised.join(", "))));
+    if !pinned.is_empty() && !contains_str(advertised, pinned) {
+        return Err(OidcError::new("discovery", format!("the provider does not advertise id_token alg {pinned}")));
     }
-    Ok(allowed)
+    let accepted: Vec<String> = wanted.iter().filter(|alg| contains_str(advertised, alg)).cloned().collect();
+    if accepted.is_empty() {
+        return Err(OidcError::new("discovery", format!("the provider advertises none of this client's ID token algorithms ({}); it advertises {}", wanted.join(", "), advertised.join(", "))));
+    }
+    Ok(accepted)
+}
+
+/// An algorithm the application may name for ID tokens.
+pub fn check_id_token_alg(alg: &str) -> Result<(), OidcError> {
+    if alg.eq_ignore_ascii_case("none") {
+        return Err(OidcError::new("config", "an unsigned ID token (alg none) is never accepted"));
+    }
+    if !ASYMMETRIC.contains(&alg) && !SYMMETRIC.contains(&alg) {
+        return Err(OidcError::new("config", format!("the ID token algorithm {alg} cannot be verified by this client")));
+    }
+    Ok(())
 }
 
 pub fn scheme_of(value: &str) -> String {

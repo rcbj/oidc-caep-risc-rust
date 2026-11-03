@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 use crate::b64::{b64url_decode, b64url_encode};
 use crate::error::OidcError;
 use crate::http::send;
-use crate::keys::{public_key_from_jwk, verify_hmac, verify_signature};
+use crate::keys::{kty_for, public_key_from_jwk, verify_hmac, verify_signature};
 use crate::value::{as_f64, as_map_owned, contains_str, map_str, sprint, JsonMap};
 
 const NOT_ID: &[&str] = &[
@@ -55,6 +55,12 @@ pub struct TokenChecks {
     pub code: String,
     pub previous_sub: Option<String>,
     pub max_age: Option<f64>,
+    /// The header must carry `typ` (`JWT` or `application/jwt`).
+    pub require_typ: bool,
+    /// When `access_token` is set, the payload must carry `at_hash`.
+    pub require_at_hash: bool,
+    /// The `acr_values` the authorization request named; the ID token's `acr` must be one of them.
+    pub acr_values: Vec<String>,
 }
 
 impl Default for TokenChecks {
@@ -72,6 +78,9 @@ impl Default for TokenChecks {
             code: String::new(),
             previous_sub: None,
             max_age: None,
+            require_typ: false,
+            require_at_hash: false,
+            acr_values: Vec::new(),
         }
     }
 }
@@ -91,15 +100,7 @@ fn decode_part(token: &str, index: usize, what: &str) -> Result<JsonMap, OidcErr
 }
 
 fn candidates<'a>(jwks: &'a [JsonMap], alg: &str, kid: &str) -> Vec<&'a JsonMap> {
-    let kty = if alg.starts_with("RS") || alg.starts_with("PS") {
-        "RSA"
-    } else if alg.starts_with("ES") {
-        "EC"
-    } else if alg == "EdDSA" || alg == "Ed25519" {
-        "OKP"
-    } else if alg.starts_with("HS") {
-        "oct"
-    } else {
+    let Some(kty) = kty_for(alg) else {
         return Vec::new();
     };
     jwks.iter()
@@ -140,13 +141,13 @@ fn signature_ok(token: &str, alg: &str, jwks: &[JsonMap], secret: &str) -> Resul
     Ok(false)
 }
 
-fn check_hash(claim: Option<&Value>, value: &str, alg: &str, name: &str) -> Result<(), OidcError> {
-    let Some(claim) = claim else {
+fn check_hash(claim: Option<&Value>, value: &str, alg: &str, name: &str, required: bool) -> Result<(), OidcError> {
+    let Some(claim) = claim.filter(|v| !v.is_null()) else {
+        if required {
+            return Err(OidcError::new("validation", format!("the ID token has no {name}, and the token response carries an access token")));
+        }
         return Ok(());
     };
-    if claim.is_null() {
-        return Ok(());
-    }
     let Some(text) = claim.as_str() else {
         return Err(OidcError::new("validation", format!("the ID token's {name} does not match")));
     };
@@ -166,11 +167,20 @@ pub fn validate_id_token(token: &str, checks: &TokenChecks) -> Result<JsonMap, O
     if header.get("crit").is_some_and(|v| !v.is_null()) {
         return Err(OidcError::new("validation", "the ID token has a crit header this client does not understand"));
     }
-    if let Some(raw_typ) = header.get("typ").filter(|v| !v.is_null()) {
-        let typ = sprint(raw_typ).to_ascii_lowercase();
-        if !typ.is_empty() && ((typ != "jwt" && typ != "application/jwt") || NOT_ID.contains(&typ.as_str())) {
-            return Err(OidcError::new("validation", format!("the ID token typ is {raw_typ}, not an ID token")));
+    match header.get("typ").filter(|v| !v.is_null()) {
+        Some(raw_typ) => {
+            let typ = sprint(raw_typ).to_ascii_lowercase();
+            if typ.is_empty() && checks.require_typ {
+                return Err(OidcError::new("validation", "the ID token header has an empty typ; it must be JWT"));
+            }
+            if !typ.is_empty() && ((typ != "jwt" && typ != "application/jwt") || NOT_ID.contains(&typ.as_str())) {
+                return Err(OidcError::new("validation", format!("the ID token typ is {raw_typ}, not an ID token")));
+            }
         }
+        None if checks.require_typ => {
+            return Err(OidcError::new("validation", "the ID token header has no typ; it must be JWT"));
+        }
+        None => {}
     }
     if alg.starts_with("HS") && checks.client_secret.is_empty() {
         return Err(OidcError::new("config", format!("{alg} ID tokens need the client secret")));
@@ -200,6 +210,11 @@ pub fn validate_id_token(token: &str, checks: &TokenChecks) -> Result<JsonMap, O
     if let Some(nbf) = payload.get("nbf").and_then(as_f64) {
         if nbf - tolerance > now {
             return Err(OidcError::new("validation", "the ID token was refused: nbf is in the future"));
+        }
+    }
+    if let Some(iat) = payload.get("iat").and_then(as_f64) {
+        if iat - tolerance > now {
+            return Err(OidcError::new("validation", "the ID token was refused: iat is in the future"));
         }
     }
     if let Some(max_age) = checks.max_id_token_age_sec {
@@ -232,15 +247,23 @@ pub fn validate_id_token(token: &str, checks: &TokenChecks) -> Result<JsonMap, O
         }
     }
     if !checks.access_token.is_empty() {
-        check_hash(payload.get("at_hash"), &checks.access_token, &alg, "at_hash")?;
+        check_hash(payload.get("at_hash"), &checks.access_token, &alg, "at_hash", checks.require_at_hash)?;
     }
     if !checks.code.is_empty() {
-        check_hash(payload.get("c_hash"), &checks.code, &alg, "c_hash")?;
+        check_hash(payload.get("c_hash"), &checks.code, &alg, "c_hash", false)?;
     }
     if let Some(max_age) = checks.max_age {
         let auth_time = payload.get("auth_time").and_then(as_f64).ok_or_else(|| OidcError::new("validation", "max_age was requested and the ID token has no auth_time"))?;
         if auth_time < now_sec().floor() - max_age - tolerance {
             return Err(OidcError::new("validation", "the ID token auth_time is older than max_age"));
+        }
+    }
+    if !checks.acr_values.is_empty() {
+        let Some(acr) = payload.get("acr").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) else {
+            return Err(OidcError::new("validation", format!("acr_values {} was requested and the ID token has no acr", checks.acr_values.join(" "))));
+        };
+        if !contains_str(&checks.acr_values, acr) {
+            return Err(OidcError::new("validation", format!("the ID token acr {acr} is not one of the requested acr_values {}", checks.acr_values.join(" "))));
         }
     }
     Ok(payload)
