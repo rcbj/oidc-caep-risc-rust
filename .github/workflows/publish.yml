@@ -10,19 +10,29 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+
+# One release at a time: each reads the version the one before it took.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   publish:
-    # Tests has already succeeded for this commit on main. Publish only
-    # when that commit is a pull request merged into main. A direct push
-    # stays unpublished. The checkout is the commit tests ran, and a
-    # version already on crates.io is left there.
+    # The test workflow has already succeeded for this commit on main. Release
+    # only when that commit is a pull request merged into main; a direct push
+    # stays unreleased. .github/scripts/release_decision.py picks the version:
+    # VERSION when it is ahead of what is published, one patch higher when the
+    # shipped files changed since the last release's tag, and otherwise no
+    # release at all, so a change to tests, the demo, or the docs ships nothing.
+    # The version is written into this workspace only and is never committed.
     if: >
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
     steps:
       - name: Require a pull request merged into main
         id: gate
@@ -42,41 +52,45 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Every tag: the last release's tag is what the decision compares with.
       - uses: actions/checkout@v4
         if: steps.gate.outputs.publish == 'true'
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Publish the crate
+      - name: Decide whether this commit is a release
+        id: decide
         if: steps.gate.outputs.publish == 'true'
         env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 .github/scripts/release_decision.py decide crates oidc-caep-risc "$SHA" src Cargo.toml ':(exclude,glob)src/**/tests/**' ':(exclude,glob)src/**/*_test.rs'
+
+      - name: Publish the crate
+        if: steps.decide.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -eu
-          python3 - <<'PY'
-          import tomllib
-          pkg = tomllib.load(open("Cargo.toml", "rb"))["package"]
-          with open("/tmp/crate-id", "w", encoding="utf-8") as fh:
-              fh.write(pkg["name"] + "\n" + pkg["version"] + "\n")
-          PY
-          name=$(sed -n '1p' /tmp/crate-id)
-          version=$(sed -n '2p' /tmp/crate-id)
-          code=$(curl -sS -o /tmp/crate-version.json -w '%{http_code}' \
-            -A "rcbjBlueMars (${GITHUB_REPOSITORY})" \
-            "https://crates.io/api/v1/crates/${name}/${version}")
-          if [ "$code" = "200" ]; then
-            echo "${name} ${version} is already on crates.io."
-            exit 0
-          fi
-          if [ "$code" != "404" ]; then
-            echo "crates.io returned ${code} for ${name} ${version}."
-            python3 -c 'print(open("/tmp/crate-version.json", encoding="utf-8").read()[:500])'
-            exit 1
-          fi
+          python3 .github/scripts/release_decision.py stamp crates "$VERSION"
+          # --allow-dirty: the stamped version is the workspace's only change.
           docker run --rm \
             -v "$PWD":/src \
             -w /src \
             -e CARGO_REGISTRY_TOKEN \
             rust:1-bookworm \
-            cargo publish --locked
+            cargo publish --locked --allow-dirty
+
+      # Publishing and this step are one release: the tag it creates is the
+      # baseline the next decision compares with.
+      - name: Create the tag and the GitHub Release
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "$TAG" --generate-notes
