@@ -14,7 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hmac::Mac;
-use rsa::signature::{RandomizedSigner, SignatureEncoding, Signer};
+use p256::ecdsa::signature::Signer as _;
+use p256::elliptic_curve::Generate;
+use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::traits::PublicKeyParts;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -52,18 +54,18 @@ fn alg_keys() -> &'static AlgKeys {
     static KEYS: OnceLock<AlgKeys> = OnceLock::new();
     KEYS.get_or_init(|| {
         let mut rng = rand::rngs::OsRng;
-        let p256 = p256::ecdsa::SigningKey::random(&mut rng);
-        let p384 = p384::ecdsa::SigningKey::random(&mut rng);
-        let p521 = p521::ecdsa::SigningKey::random(&mut rng);
+        let p256 = p256::ecdsa::SigningKey::generate();
+        let p384 = p384::ecdsa::SigningKey::generate();
+        let p521 = p521::ecdsa::SigningKey::generate();
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rng, &mut seed);
         let ed = ed25519_dalek::SigningKey::from_bytes(&seed);
         let rsa = &keys().provider;
         let jwks = vec![
             json!({"kty": "RSA", "kid": "rsa", "use": "sig", "n": b64url_encode(&rsa.n().to_bytes_be()), "e": b64url_encode(&rsa.e().to_bytes_be())}),
-            ec_jwk("p256", "P-256", p256.verifying_key().to_encoded_point(false).as_bytes(), 32),
-            ec_jwk("p384", "P-384", p384.verifying_key().to_encoded_point(false).as_bytes(), 48),
-            ec_jwk("p521", "P-521", p521::ecdsa::VerifyingKey::from(&p521).to_encoded_point(false).as_bytes(), 66),
+            ec_jwk("p256", "P-256", p256.verifying_key().to_sec1_point(false).as_bytes(), 32),
+            ec_jwk("p384", "P-384", p384.verifying_key().to_sec1_point(false).as_bytes(), 48),
+            ec_jwk("p521", "P-521", p521::ecdsa::VerifyingKey::from(&p521).to_sec1_point(false).as_bytes(), 66),
             json!({"kty": "OKP", "crv": "Ed25519", "kid": "ed", "use": "sig", "x": b64url_encode(ed.verifying_key().as_bytes())}),
         ];
         AlgKeys { p256, p384, p521, ed, jwks }
@@ -557,9 +559,9 @@ fn dpop_modes() {
 fn dpop_key_from_pem() {
     use p256::pkcs8::EncodePrivateKey;
     let op = start_op(dpop_cfg());
-    let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    let key = p256::ecdsa::SigningKey::generate();
     let pem = key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap().to_string();
-    let point = key.verifying_key().to_encoded_point(false);
+    let point = key.verifying_key().to_sec1_point(false);
     let canonical = format!("{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}", b64url_encode(point.x().unwrap()), b64url_encode(point.y().unwrap()));
     let expected = b64url_encode(&Sha256::digest(canonical.as_bytes()));
     let one = rp_for(op, json!({"dpopKey": pem}));

@@ -4,6 +4,7 @@
 use hmac::{Hmac, Mac};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
+use p256::ecdsa::signature::Verifier as _;
 use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
 use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
 use sha2::{Sha256, Sha384, Sha512};
