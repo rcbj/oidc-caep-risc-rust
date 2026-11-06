@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use p256::ecdsa::signature::Signer;
+use p256::elliptic_curve::Generate;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use serde_json::{json, Value};
@@ -32,7 +33,7 @@ pub struct Dpop {
 impl Dpop {
     /// A key pair generated now and held in memory only.
     pub fn generate() -> Self {
-        Self::from_key(SigningKey::random(&mut rand::rngs::OsRng))
+        Self::from_key(SigningKey::generate())
     }
 
     /// A P-256 private key in PEM (PKCS #8 `PRIVATE KEY` or SEC 1 `EC PRIVATE KEY`).
@@ -44,7 +45,7 @@ impl Dpop {
     }
 
     fn from_key(key: SigningKey) -> Self {
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let x = b64url_encode(point.x().map(|v| v.as_slice()).unwrap_or_default());
         let y = b64url_encode(point.y().map(|v| v.as_slice()).unwrap_or_default());
         // RFC 7638: the required members only, in lexicographic order, no white space.
