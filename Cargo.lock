@@ -733,7 +733,7 @@ dependencies = [
  "rand",
  "rsa",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "signature 2.2.0",
  "tiny_http",
  "ureq",

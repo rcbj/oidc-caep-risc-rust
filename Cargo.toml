@@ -23,7 +23,7 @@ p521 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.8"
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
+sha2 = "0.11"
 signature = "2"
 tiny_http = "0.12"
 ureq = { version = "2.12", default-features = false, features = ["tls", "native-tls"] }
