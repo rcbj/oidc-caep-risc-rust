@@ -53,7 +53,7 @@ jobs:
           fi
 
       # Every tag: the last release's tag is what the decision compares with.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.gate.outputs.publish == 'true'
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
