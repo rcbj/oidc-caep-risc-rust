@@ -24,6 +24,7 @@ jobs:
     # VERSION when it is ahead of what is published, one patch higher when the
     # shipped files changed since the last release's tag, and otherwise no
     # release at all, so a change to tests, the demo, or the docs ships nothing.
+    # src/suite.rs is the harness and is excluded with the tests.
     # The version is written into this workspace only and is never committed.
     if: >
       github.event.workflow_run.conclusion == 'success' &&
@@ -66,7 +67,7 @@ jobs:
         env:
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          python3 .github/scripts/release_decision.py decide crates oidc-caep-risc "$SHA" src Cargo.toml ':(exclude,glob)src/**/tests/**' ':(exclude,glob)src/**/*_test.rs'
+          python3 .github/scripts/release_decision.py decide crates oidc-caep-risc "$SHA" src Cargo.toml ':(exclude,glob)src/**/tests/**' ':(exclude,glob)src/**/*_test.rs' ':(exclude)src/suite.rs'
 
       - name: Publish the crate
         if: steps.decide.outputs.release == 'true'

@@ -811,6 +811,10 @@ pub(crate) fn ath_of(token: &str) -> String {
 }
 
 pub(crate) fn start_transmitter() -> &'static Transmitter {
+    // Two RSA-2048 keys. Generating them inside /jwks can outlast the
+    // client's 15 s timeout on a busy machine. start_op calls alg_keys()
+    // before it accepts a connection for the same reason (#41).
+    ssf_keys();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let tx: &'static Transmitter = Box::leak(Box::new(Transmitter {
