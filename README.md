@@ -37,6 +37,8 @@ The same camelCase keys work in a configuration file (`from_file`, `resolve_conf
 | `acrValues` | none | A string or a list. Sent as `acr_values`; the ID token from the code exchange must carry an `acr` that is one of them. `AuthorizeOptions::acr_values` replaces it per request. The refresh path does not re-check `acr`. |
 | `clockToleranceSec` | `30` | Skew allowed on `exp`, `nbf` and `iat`. An `iat` further in the future is refused. |
 | `maxIdTokenAgeSec` | `600` | The oldest `iat` accepted. |
+| `sessionMaxEntries` | `10000` | The most sign-ins the default session store (`MemorySessionStore`) keeps. Past it, a new session drops the oldest-written one. A whole number, 1 or more. |
+| `sessionTtlSec` | `86400` | How long the default store keeps a sign-in after it was last written (sign-in or refresh). `0`: until removed or evicted. An expired entry is never answered. |
 | `redirectUri`, `postLogoutRedirectUri` | | https, or http on `localhost`, `127.0.0.1` or `[::1]`. `allowInsecure` does not relax this (it lets a development provider's own endpoints use http). A per-request `AuthorizeOptions::redirect_uri` is held to the same rule. |
 
 ## DPoP
@@ -45,7 +47,15 @@ With DPoP in use, the relying party sends `dpop_jkt` on the authorization reques
 
 ## Session cache
 
-`complete_session(query, txn, session_id)` keeps the sign-in under a session identifier the application chooses (empty makes one, returned as `Login::session_id`). `session_access_token(session_id)` returns the cached access token while it has more than 30 seconds left, and otherwise refreshes it (with a DPoP proof when DPoP is in use) and updates the cache; a failed refresh removes the entry and returns the refusal. `remove_session` clears an entry (sign-out). A `SignalsReceiver` built with `relying_party` removes the sessions a CAEP `session-revoked` (or any ending event) ends. The default store is `MemorySessionStore`; `set_session_store` takes any `SessionStore`, such as one shared by several processes.
+`complete_session(query, txn, session_id)` keeps the sign-in under a session identifier the application chooses (empty makes one, returned as `Login::session_id`). `session_access_token(session_id)` returns the cached access token while it has more than 30 seconds left, and otherwise refreshes it (with a DPoP proof when DPoP is in use) and updates the cache; a failed refresh removes the entry and returns the refusal. `remove_session` clears an entry (sign-out). A `SignalsReceiver` built with `relying_party` removes the sessions a CAEP `session-revoked` (or any ending event) ends. The default store is `MemorySessionStore`, bounded by `sessionMaxEntries` and `sessionTtlSec` (`MemorySessionStore::new(max, ttl_sec)` builds one directly; `stats()` reports entries, bounds, and how many expired or were evicted; `purge_expired()` drops expired entries now, which a write also does when it needs room). An application that must never lose a live session to eviction keeps its own sessions below the bound and removes each one it ends. `set_session_store` takes any `SessionStore`, such as one shared by several processes.
+
+## Shared Signals receiver health
+
+`SignalsReceiver::health()` returns a `ReceiverHealth`: `running`, `stream_id`, `started_at`, `last_poll_at`, `last_success_at`, `last_error` and `last_error_at` (a failed `start` is recorded as `start: ...`), `consecutive_failures`, `polls`, `failed_polls`, `sets_accepted`, `sets_refused`, `sessions_ended`, and `poll_interval_ms`. Times are seconds since the Unix epoch; nothing in it is a token, an event, or a subject. `is_healthy(max_age_sec)` is true while the receiver runs and a poll succeeded (or it started) within that many seconds. A receiver that fails every poll keeps backing off (four times the interval, at most 60 s) and says so here, so an application can fall back to another liveness check. `ReceiverOptions::on_error` receives each failed poll, refused SET, or panicking handler as one line (no token) instead of stderr. `stop()` wakes the poll thread at once and waits only for a transmitter call already in flight; the receiver polls on its one thread and spawns none per poll.
+
+## Async (feature `tokio`)
+
+With `features = ["tokio"]`, every call that can reach the network has an `_async` twin: `RelyingParty::create_async`, `from_file_async`, `authorize_async`, `complete_async`, `complete_session_async`, `session_access_token_async`, `refresh_async`, `client_credentials_async`, `userinfo_async`, and `SignalsReceiver::start_async`, `stop_async`, `poll_once_async` (the methods take `self: &Arc<Self>`). They run the blocking call on tokio's blocking pool, so no runtime worker thread waits on the network. The HTTP client is still `ureq`: each call holds one blocking-pool thread for as long as it takes (at most the 15 s timeout per request), and dropping the future does not cancel the request. `session`, `remove_session`, `health`, `track` and `untrack` never touch the network and stay synchronous.
 
 ## Tests
 
@@ -53,7 +63,7 @@ With DPoP in use, the relying party sends `dpop_jkt` on the authorization reques
 docker build --target test .
 ```
 
-The suite runs in a container.
+The suite runs in a container, with every feature (`cargo test --all-features`), and checks the library also builds without them.
 
 The tests build an in-process stub provider and a stub transmitter. They do not need a live iya-sts.
 
