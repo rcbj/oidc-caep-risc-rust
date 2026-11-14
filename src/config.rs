@@ -239,7 +239,7 @@ pub fn resolve_config(raw: &JsonMap, base_dir: &str) -> Result<Resolved, OidcErr
     if let Some(alg) = raw.get("idTokenSignedResponseAlg").filter(|v| !v.is_null()).map(sprint).filter(|v| !v.is_empty()) {
         out.insert("idTokenSignedResponseAlg".into(), Value::String(alg));
     }
-    for key in ["par", "dpop", "idTokenSigningAlgs", "requireIdTokenTypAndAtHash", "acrValues", "clockToleranceSec", "maxIdTokenAgeSec"] {
+    for key in ["par", "dpop", "idTokenSigningAlgs", "requireIdTokenTypAndAtHash", "acrValues", "clockToleranceSec", "maxIdTokenAgeSec", "sessionMaxEntries", "sessionTtlSec"] {
         if let Some(value) = raw.get(key).filter(|v| !v.is_null()) {
             out.insert(key.into(), value.clone());
         }
@@ -284,6 +284,19 @@ fn seconds(config: &mut JsonMap, key: &str, default: i64) -> Result<(), OidcErro
     }
 }
 
+/// A whole number, `min` or more, written back as an integer.
+fn whole(config: &mut JsonMap, key: &str, default: u64, min: u64) -> Result<(), OidcError> {
+    let value = match config.get(key).filter(|v| !v.is_null()) {
+        None => default,
+        Some(value) => match as_f64(value) {
+            Some(n) if n.is_finite() && n.fract() == 0.0 && n >= min as f64 && n <= u32::MAX as f64 => n as u64,
+            _ => return Err(OidcError::new("config", format!("{key} must be a whole number, {min} or more"))),
+        },
+    };
+    config.insert(key.into(), Value::Number(Number::from(value)));
+    Ok(())
+}
+
 fn words(value: &Value) -> Option<Vec<String>> {
     if let Some(list) = as_string_list(value) {
         return Some(list.into_iter().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect());
@@ -294,13 +307,17 @@ fn words(value: &Value) -> Option<Vec<String>> {
 /// The defaults and checks every relying party gets, whether its configuration came
 /// from a file (`resolve_config`) or was handed to `RelyingParty::create` directly:
 /// `par` and `dpop` (auto), `clockToleranceSec` (30), `maxIdTokenAgeSec` (600),
-/// `idTokenSigningAlgs` (`["RS256"]`), `requireIdTokenTypAndAtHash` (true), and the
+/// `idTokenSigningAlgs` (`["RS256"]`), `requireIdTokenTypAndAtHash` (true),
+/// `sessionMaxEntries` (10000) and `sessionTtlSec` (86400, 0 for no expiry) for the
+/// default session store, and the
 /// redirect URI rule (https, or http on `localhost`, `127.0.0.1`, or `[::1]`).
 pub fn apply_defaults(config: &mut JsonMap) -> Result<(), OidcError> {
     mode(config, "par")?;
     mode(config, "dpop")?;
     seconds(config, "clockToleranceSec", 30)?;
     seconds(config, "maxIdTokenAgeSec", 600)?;
+    whole(config, "sessionMaxEntries", crate::rp::DEFAULT_SESSION_MAX_ENTRIES as u64, 1)?;
+    whole(config, "sessionTtlSec", crate::rp::DEFAULT_SESSION_TTL_SEC, 0)?;
     let algs = match config.get("idTokenSigningAlgs").filter(|v| !v.is_null()) {
         None => vec!["RS256".to_string()],
         Some(value) => words(value).ok_or_else(|| OidcError::new("config", "idTokenSigningAlgs must be a list of algorithm names"))?,

@@ -5,7 +5,7 @@
 FROM rust:1-bookworm AS test
 WORKDIR /src
 COPY . .
-RUN cargo test
+RUN cargo test --all-features && cargo build --lib
 
 FROM rust:1-bookworm AS build
 WORKDIR /src

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -315,15 +315,68 @@ pub struct ReceiverOptions {
     pub description: String,
     pub poll_interval_ms: i64,
     pub max_events: i64,
+    /// Where the receiver reports a failed poll, a refused SET, or a handler that
+    /// panicked: one line, no token. Unset, it is written to stderr.
+    pub on_error: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl Default for ReceiverOptions {
     fn default() -> Self {
-        Self { tls_ca: None, headers: None, relying_party: None, scope: String::new(), events_requested: Vec::new(), end_on: Vec::new(), description: String::new(), poll_interval_ms: 0, max_events: 0 }
+        Self { tls_ca: None, headers: None, relying_party: None, scope: String::new(), events_requested: Vec::new(), end_on: Vec::new(), description: String::new(), poll_interval_ms: 0, max_events: 0, on_error: None }
+    }
+}
+
+/// What a receiver can say about its poll stream, for a health endpoint
+/// (`SignalsReceiver::health`). Times are seconds since the Unix epoch. No
+/// token, no event and no subject is ever kept here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReceiverHealth {
+    /// `start` succeeded and `stop` has not been called.
+    pub running: bool,
+    /// The transmitter's stream id, once the stream was found or created.
+    pub stream_id: String,
+    pub started_at: Option<f64>,
+    /// The last poll that was attempted, whatever its outcome.
+    pub last_poll_at: Option<f64>,
+    /// The last poll the transmitter answered with 200.
+    pub last_success_at: Option<f64>,
+    /// The last failure (of `start` or of a poll), and when.
+    pub last_error: String,
+    pub last_error_at: Option<f64>,
+    /// Polls that failed since the last one that succeeded.
+    pub consecutive_failures: u64,
+    pub polls: u64,
+    pub failed_polls: u64,
+    pub sets_accepted: u64,
+    pub sets_refused: u64,
+    /// Local sessions the receiver ended (each session once per event).
+    pub sessions_ended: u64,
+    /// The configured poll interval, so a reader can judge `last_success_at`.
+    pub poll_interval_ms: i64,
+}
+
+impl ReceiverHealth {
+    /// Running, and a poll succeeded within `max_age_sec` of `now` (seconds since
+    /// the epoch). A receiver that has not completed its first poll yet counts from
+    /// `started_at`, since `start` itself reached the transmitter.
+    pub fn is_healthy_at(&self, now: f64, max_age_sec: f64) -> bool {
+        if !self.running {
+            return false;
+        }
+        match self.last_success_at.or(self.started_at) {
+            Some(at) => now - at <= max_age_sec,
+            None => false,
+        }
+    }
+
+    /// `is_healthy_at` now.
+    pub fn is_healthy(&self, max_age_sec: f64) -> bool {
+        self.is_healthy_at(now_sec(), max_age_sec)
     }
 }
 
 struct Shared {
+    health: ReceiverHealth,
     config: Option<JsonMap>,
     stream: Option<JsonMap>,
     keys: Vec<JsonMap>,
@@ -349,9 +402,10 @@ pub struct SignalsReceiver {
     description: String,
     poll_ms: i64,
     max_events: i64,
+    on_error: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     index: Arc<Mutex<SessionIndex>>,
     shared: Arc<Mutex<Shared>>,
-    stop: Arc<Mutex<bool>>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -376,6 +430,7 @@ impl SignalsReceiver {
             description: opts.description,
             poll_ms: poll,
             max_events,
+            on_error: opts.on_error,
             index: Arc::new(Mutex::new(SessionIndex::new(0))),
             shared: Arc::new(Mutex::new(Shared {
                 config: None,
@@ -388,8 +443,9 @@ impl SignalsReceiver {
                 handlers: HashMap::new(),
                 inflight_done: true,
                 inflight: None,
+                health: ReceiverHealth { poll_interval_ms: poll, ..ReceiverHealth::default() },
             })),
-            stop: Arc::new(Mutex::new(false)),
+            stop: Arc::new((Mutex::new(false), Condvar::new())),
             thread: Mutex::new(None),
         })
     }
@@ -413,7 +469,24 @@ impl SignalsReceiver {
         self.shared.lock().unwrap_or_else(|e| e.into_inner()).handlers.entry(event_type.to_string()).or_default().push(Arc::new(handler));
     }
 
+    /// The poll stream's state: running, the last successful poll, the last error.
+    pub fn health(&self) -> ReceiverHealth {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).health.clone()
+    }
+
+    /// Finds or creates the stream and starts polling it on a thread of its own.
+    /// A failure is also recorded in `health()`.
     pub fn start(&self) -> Result<(), OidcError> {
+        let result = self.start_inner();
+        if let Err(err) = &result {
+            let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            shared.health.last_error = format!("start: {err}");
+            shared.health.last_error_at = Some(now_sec());
+        }
+        result
+    }
+
+    fn start_inner(&self) -> Result<(), OidcError> {
         if self.shared.lock().unwrap_or_else(|e| e.into_inner()).running {
             return Ok(());
         }
@@ -433,23 +506,33 @@ impl SignalsReceiver {
                 shared.stream = Some(stream);
                 return Ok(());
             }
+            shared.health.stream_id = map_str(&stream, "stream_id");
             shared.stream = Some(stream);
             shared.running = true;
+            shared.health.running = true;
+            shared.health.started_at = Some(now_sec());
         }
-        *self.stop.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *self.stop.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
         let worker = self.worker();
         let handle = thread::spawn(move || worker.loop_poll());
         *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         Ok(())
     }
 
-    /// Stops polling and waits until the background poll has finished.
+    /// Stops polling and waits until the background poll has finished. The poll
+    /// thread is woken at once; only a transmitter call already in flight is waited
+    /// for (at most the HTTP timeout, 15 s).
     pub fn stop(&self) {
         {
             let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             shared.running = false;
+            shared.health.running = false;
         }
-        *self.stop.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        {
+            let (flag, wake) = &*self.stop;
+            *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            wake.notify_all();
+        }
         let handle = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(handle) = handle {
             let started = Instant::now();
@@ -480,6 +563,7 @@ impl SignalsReceiver {
             end_on: self.end_on.clone(),
             poll_ms: self.poll_ms,
             max_events: self.max_events,
+            on_error: self.on_error.clone(),
             index: Arc::clone(&self.index),
             shared: Arc::clone(&self.shared),
             stop: Arc::clone(&self.stop),
@@ -496,9 +580,21 @@ struct Worker {
     end_on: Vec<String>,
     poll_ms: i64,
     max_events: i64,
+    on_error: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     index: Arc<Mutex<SessionIndex>>,
     shared: Arc<Mutex<Shared>>,
-    stop: Arc<Mutex<bool>>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Worker {
+    fn report(&self, line: &str) {
+        match &self.on_error {
+            Some(report) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(line)));
+            }
+            None => eprintln!("{line}"),
+        }
+    }
 }
 
 impl Worker {
@@ -514,46 +610,68 @@ impl Worker {
                 Ok(true) => delay = 0,
                 Ok(false) => {}
                 Err(err) => {
-                    eprintln!("ssf: poll failed: {err}");
+                    self.report(&format!("ssf: poll failed: {err}"));
                     delay = (self.poll_ms * 4).min(60_000);
                 }
             }
             if !self.shared.lock().unwrap_or_else(|e| e.into_inner()).running {
                 return;
             }
-            let started = Instant::now();
-            while started.elapsed() < Duration::from_millis(delay as u64) {
-                if *self.stop.lock().unwrap_or_else(|e| e.into_inner()) {
-                    return;
+            // Sleeps until the delay has passed or `stop` wakes it.
+            let deadline = Instant::now() + Duration::from_millis(delay.max(0) as u64);
+            let (flag, wake) = &*self.stop;
+            let mut stopped = flag.lock().unwrap_or_else(|e| e.into_inner());
+            while !*stopped {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
                 }
-                thread::sleep(Duration::from_millis(20));
+                stopped = wake.wait_timeout(stopped, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
+            }
+            if *stopped {
+                return;
             }
         }
     }
 
+    /// One poll, single-flight: a caller that finds no poll in flight runs it on its
+    /// own thread (no thread is spawned per poll); one that finds a poll in flight
+    /// waits for that poll's result.
     fn poll_once(&self) -> Result<bool, OidcError> {
-        let flight = {
+        type Flight = Arc<(Mutex<Option<Result<bool, String>>>, Condvar)>;
+        let (flight, mine): (Flight, bool) = {
             let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             let finished = match &shared.inflight {
                 None => true,
                 Some(existing) => existing.0.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
             };
             if finished {
-                let flight = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+                let flight = Arc::new((Mutex::new(None), Condvar::new()));
                 shared.inflight = Some(Arc::clone(&flight));
-                let worker = self.clone_worker();
-                let background = Arc::clone(&flight);
-                thread::spawn(move || {
-                    let result = worker.poll_now().map_err(|err| err.message);
-                    let mut slot = background.0.lock().unwrap_or_else(|e| e.into_inner());
-                    *slot = Some(result);
-                    background.1.notify_all();
-                });
-                flight
+                (flight, true)
             } else {
-                Arc::clone(shared.inflight.as_ref().unwrap())
+                (Arc::clone(shared.inflight.as_ref().unwrap()), false)
             }
         };
+        if mine {
+            // Whatever happens (a panic in a handler included), the waiters are
+            // released with a result.
+            struct Release(Flight, Option<Result<bool, String>>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    let result = self.1.take().unwrap_or_else(|| Err("the poll did not finish".into()));
+                    let mut slot = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = Some(result);
+                    self.0 .1.notify_all();
+                }
+            }
+            let mut release = Release(Arc::clone(&flight), None);
+            let result = self.poll_now();
+            self.record_poll(&result);
+            release.1 = Some(result.as_ref().map(|more| *more).map_err(|err| err.message.clone()));
+            drop(release);
+            return result;
+        }
         let mut slot = flight.0.lock().unwrap_or_else(|e| e.into_inner());
         while slot.is_none() {
             slot = flight.1.wait(slot).unwrap_or_else(|e| e.into_inner());
@@ -561,6 +679,26 @@ impl Worker {
         match slot.clone().unwrap() {
             Ok(more) => Ok(more),
             Err(message) => Err(OidcError::new("ssf", message)),
+        }
+    }
+
+    fn record_poll(&self, result: &Result<bool, OidcError>) {
+        let now = now_sec();
+        let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let health = &mut shared.health;
+        health.polls += 1;
+        health.last_poll_at = Some(now);
+        match result {
+            Ok(_) => {
+                health.last_success_at = Some(now);
+                health.consecutive_failures = 0;
+            }
+            Err(err) => {
+                health.failed_polls += 1;
+                health.consecutive_failures += 1;
+                health.last_error = clip(&err.to_string(), 300);
+                health.last_error_at = Some(now);
+            }
         }
     }
 
@@ -574,6 +712,7 @@ impl Worker {
             end_on: self.end_on.clone(),
             poll_ms: self.poll_ms,
             max_events: self.max_events,
+            on_error: self.on_error.clone(),
             index: Arc::clone(&self.index),
             shared: Arc::clone(&self.shared),
             stop: Arc::clone(&self.stop),
@@ -614,15 +753,18 @@ impl Worker {
                 continue;
             };
             if let Err(err) = self.handle(jti, token) {
-                eprintln!("ssf: SET {jti} refused: {err}");
+                self.report(&format!("ssf: SET {jti} refused: {err}"));
                 let code = if err.code == "signature" { "invalid_key" } else { "invalid_request" };
                 let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 let mut doc = Map::new();
                 doc.insert("err".into(), Value::String(code.into()));
                 doc.insert("description".into(), Value::String(err.message.clone()));
                 shared.errs.insert(jti.clone(), Value::Object(doc));
+                shared.health.sets_refused += 1;
             } else {
-                self.shared.lock().unwrap_or_else(|e| e.into_inner()).ack.push(jti.clone());
+                let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                shared.ack.push(jti.clone());
+                shared.health.sets_accepted += 1;
             }
         }
         let _ = raw;
@@ -712,10 +854,11 @@ impl Worker {
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.on_end)(sessions.clone(), event.clone())));
                 if result.is_err() {
-                    eprintln!("ssf: onEndSessions threw for {event_type} (SET {jti} is still acknowledged)");
+                    self.report(&format!("ssf: onEndSessions threw for {event_type} (SET {jti} is still acknowledged)"));
                     ended = false;
                     event.ended = false;
                 } else {
+                    self.shared.lock().unwrap_or_else(|e| e.into_inner()).health.sessions_ended += sessions.len() as u64;
                     for local_id in &sessions {
                         self.index.lock().unwrap_or_else(|e| e.into_inner()).remove(local_id);
                     }

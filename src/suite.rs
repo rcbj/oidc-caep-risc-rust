@@ -98,7 +98,7 @@ pub(crate) struct Req {
     pub(crate) body: String,
 }
 
-struct Stub {
+pub(crate) struct Stub {
     url: String,
     aud: Mutex<String>,
     corrupt: Mutex<bool>,
@@ -111,7 +111,7 @@ struct Stub {
     pushed: Mutex<HashMap<String, HashMap<String, String>>>,
 }
 
-fn start_provider() -> &'static Stub {
+pub(crate) fn start_provider() -> &'static Stub {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let stub: &'static Stub = Box::leak(Box::new(Stub {
@@ -412,7 +412,7 @@ fn authorized(stub: &Stub, req: &Req) -> bool {
     assertion_ok(assertion, &stub.url)
 }
 
-fn provider_config(stub: &Stub, over: Value) -> JsonMap {
+pub(crate) fn provider_config(stub: &Stub, over: Value) -> JsonMap {
     let mut doc = json!({
         "metadataUrl": format!("{}/.well-known/openid-configuration", stub.url),
         "clientId": CLIENT,

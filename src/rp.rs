@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
 // SPDX-License-Identifier: MIT
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -174,23 +174,158 @@ pub trait SessionStore: Send + Sync {
     fn remove(&self, session_id: &str);
 }
 
-/// The default session store: this process's memory.
+/// The most sign-ins `MemorySessionStore::default()` keeps (`sessionMaxEntries`).
+pub const DEFAULT_SESSION_MAX_ENTRIES: usize = 10_000;
+
+/// How long `MemorySessionStore::default()` keeps a sign-in after it was last
+/// written (`sessionTtlSec`): 24 hours.
+pub const DEFAULT_SESSION_TTL_SEC: u64 = 86_400;
+
+/// What a `MemorySessionStore` holds and has dropped, for a status page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionStoreStats {
+    pub entries: usize,
+    pub max_entries: usize,
+    pub ttl_sec: u64,
+    /// Entries dropped because their time to live had passed.
+    pub expired: u64,
+    /// Entries dropped, oldest first, to make room for a new one.
+    pub evicted: u64,
+}
+
+struct MemoryEntry {
+    login: Login,
+    written: Instant,
+    seq: u64,
+}
+
 #[derive(Default)]
+struct MemoryInner {
+    entries: HashMap<String, MemoryEntry>,
+    /// Write order: sequence number to session id. The smallest is the oldest.
+    order: BTreeMap<u64, String>,
+    next: u64,
+    expired: u64,
+    evicted: u64,
+}
+
+/// The default session store: this process's memory, BOUNDED.
+///
+/// An entry lives `ttl_sec` after it was last written (`complete_session`, or a
+/// refresh by `session_access_token`); an expired entry is never answered and is
+/// dropped when it is next read or when a write needs room. Past `max_entries`
+/// a write of a NEW session drops the oldest-written one, so memory is bounded
+/// whatever the application forgets to remove. An application that must never
+/// lose a live session to eviction bounds its own sessions below `max_entries`
+/// (and removes each one it ends), or implements `SessionStore` itself.
 pub struct MemorySessionStore {
-    entries: Mutex<HashMap<String, Login>>,
+    max_entries: usize,
+    ttl: Duration,
+    inner: Mutex<MemoryInner>,
+}
+
+impl Default for MemorySessionStore {
+    fn default() -> Self {
+        Self::new(DEFAULT_SESSION_MAX_ENTRIES, DEFAULT_SESSION_TTL_SEC)
+    }
+}
+
+impl MemorySessionStore {
+    /// A store of at most `max_entries` sign-ins (at least 1), each kept
+    /// `ttl_sec` seconds after it was last written (0: until removed or evicted).
+    pub fn new(max_entries: usize, ttl_sec: u64) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            ttl: if ttl_sec == 0 { Duration::MAX } else { Duration::from_secs(ttl_sec) },
+            inner: Mutex::new(MemoryInner::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemoryInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn expired(&self, entry: &MemoryEntry) -> bool {
+        entry.written.elapsed() >= self.ttl
+    }
+
+    /// Drops every expired entry. Writes do this when they need room; an
+    /// application may also call it from a timer of its own.
+    pub fn purge_expired(&self) -> usize {
+        let mut inner = self.lock();
+        self.purge_locked(&mut inner)
+    }
+
+    fn purge_locked(&self, inner: &mut MemoryInner) -> usize {
+        let stale: Vec<(u64, String)> = inner.entries.iter().filter(|(_, e)| self.expired(e)).map(|(k, e)| (e.seq, k.clone())).collect();
+        for (seq, key) in &stale {
+            inner.entries.remove(key);
+            inner.order.remove(seq);
+        }
+        inner.expired += stale.len() as u64;
+        stale.len()
+    }
+
+    /// How many sign-ins are held (expired ones not yet dropped included).
+    pub fn len(&self) -> usize {
+        self.lock().entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn stats(&self) -> SessionStoreStats {
+        let inner = self.lock();
+        SessionStoreStats {
+            entries: inner.entries.len(),
+            max_entries: self.max_entries,
+            ttl_sec: if self.ttl == Duration::MAX { 0 } else { self.ttl.as_secs() },
+            expired: inner.expired,
+            evicted: inner.evicted,
+        }
+    }
 }
 
 impl SessionStore for MemorySessionStore {
     fn get(&self, session_id: &str) -> Option<Login> {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).get(session_id).cloned()
+        let mut inner = self.lock();
+        let seq = match inner.entries.get(session_id) {
+            None => return None,
+            Some(entry) if !self.expired(entry) => return Some(entry.login.clone()),
+            Some(entry) => entry.seq,
+        };
+        inner.entries.remove(session_id);
+        inner.order.remove(&seq);
+        inner.expired += 1;
+        None
     }
 
     fn set(&self, session_id: &str, login: Login) {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string(), login);
+        let mut inner = self.lock();
+        if let Some(old) = inner.entries.remove(session_id) {
+            inner.order.remove(&old.seq);
+        } else if inner.entries.len() >= self.max_entries {
+            self.purge_locked(&mut inner);
+            while inner.entries.len() >= self.max_entries {
+                let Some((_, oldest)) = inner.order.pop_first() else {
+                    break;
+                };
+                inner.entries.remove(&oldest);
+                inner.evicted += 1;
+            }
+        }
+        let seq = inner.next;
+        inner.next += 1;
+        inner.order.insert(seq, session_id.to_string());
+        inner.entries.insert(session_id.to_string(), MemoryEntry { login, written: Instant::now(), seq });
     }
 
     fn remove(&self, session_id: &str) {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
+        let mut inner = self.lock();
+        if let Some(old) = inner.entries.remove(session_id) {
+            inner.order.remove(&old.seq);
+        }
     }
 }
 
@@ -342,6 +477,10 @@ impl RelyingParty {
         }
         let dpop = Self::dpop_key(&config, &metadata)?;
         let require_typ_at_hash = !matches!(config.get("requireIdTokenTypAndAtHash"), Some(Value::Bool(false)));
+        let sessions: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new(
+            config.get("sessionMaxEntries").and_then(|v| v.as_u64()).map_or(DEFAULT_SESSION_MAX_ENTRIES, |n| n as usize),
+            config.get("sessionTtlSec").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_SESSION_TTL_SEC),
+        ));
         Ok(Self {
             config,
             metadata,
@@ -352,7 +491,7 @@ impl RelyingParty {
             jwks: Mutex::new(None),
             used_codes: Mutex::new(HashMap::new()),
             cc: Mutex::new(None),
-            sessions: RwLock::new(Arc::new(MemorySessionStore::default())),
+            sessions: RwLock::new(sessions),
             refreshing: Mutex::new(()),
         })
     }
