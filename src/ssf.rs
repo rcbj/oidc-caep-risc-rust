@@ -702,23 +702,6 @@ impl Worker {
         }
     }
 
-    fn clone_worker(&self) -> Worker {
-        Worker {
-            on_end: Arc::clone(&self.on_end),
-            tls_ca: self.tls_ca.clone(),
-            headers: self.headers.clone(),
-            relying_party: self.relying_party.clone(),
-            scope: self.scope.clone(),
-            end_on: self.end_on.clone(),
-            poll_ms: self.poll_ms,
-            max_events: self.max_events,
-            on_error: self.on_error.clone(),
-            index: Arc::clone(&self.index),
-            shared: Arc::clone(&self.shared),
-            stop: Arc::clone(&self.stop),
-        }
-    }
-
     fn poll_now(&self) -> Result<bool, OidcError> {
         let (stream, ack, set_errs) = {
             let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
