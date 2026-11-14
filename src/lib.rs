@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
 // SPDX-License-Identifier: MIT
 
+#[cfg(feature = "tokio")]
+mod async_api;
 mod b64;
 mod config;
 mod discovery;
@@ -21,12 +23,14 @@ pub use dpop::{Dpop, DPOP_ALG};
 pub use error::OidcError;
 pub use idtoken::{hash_claim, validate_id_token};
 pub use pkce::{code_challenge_s256, random_token};
-pub use rp::{Access, AuthorizeOptions, EndSessionOptions, Login, MemorySessionStore, RelyingParty, SessionStore, Transaction, SESSION_REFRESH_MARGIN_SEC};
-pub use ssf::{subject_of, verify_compact_jws, Event, ReceiverOptions, SignalEvent, SignalsReceiver};
+pub use rp::{Access, AuthorizeOptions, EndSessionOptions, Login, MemorySessionStore, RelyingParty, SessionStore, SessionStoreStats, Transaction, DEFAULT_SESSION_MAX_ENTRIES, DEFAULT_SESSION_TTL_SEC, SESSION_REFRESH_MARGIN_SEC};
+pub use ssf::{subject_of, verify_compact_jws, Event, ReceiverHealth, ReceiverOptions, SignalEvent, SignalsReceiver};
 pub use value::JsonMap;
 
 #[cfg(test)]
 mod profile_test;
+#[cfg(test)]
+mod proxy_gaps_test;
 #[cfg(test)]
 mod suite;
 #[cfg(test)]
