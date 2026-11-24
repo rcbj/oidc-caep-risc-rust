@@ -68,7 +68,7 @@ The stub tests do not start iya-sts. `python3 scripts/live_iya_sts.py` does, unl
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. `GET /live-status` reports the sign-in and the Shared Signals events this process has accepted. It does not include tokens.
+`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. `GET /live-status` reports the sign-in and the Shared Signals events this process has accepted. It does not include tokens. The signed-in page has two tabs: **Session** (`/`) and **Policy enforcement** (`/?tab=pep`), the embedded PEP's numbers, drawn by `pep_fragment()` from the PEP's `Status` and refreshed every 2 s by `demo/public/pep.js` from `GET /pep-status.html`; `GET /pep-status` is the same as JSON (milliseconds for every time). Both need a sign-in, and carry nothing secret. Only this library's demo has the tab so far: rcbj wants the details settled here before the SAML, WS-Federation and GNAP demos get one.
 
 A loopback redirect follows `PORT` in the running server and in `scripts/configure_iya_sts.py`. Any other host is left as written. An explicit `--public-url` or a non-empty `PUBLIC_URL` replaces the origin and keeps the path. The running container's `PORT` wins over the shell's when the script registers the application. `pollIntervalMs` is a millisecond pause, not a port.
 

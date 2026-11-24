@@ -198,6 +198,15 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 
 Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/oidc.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
 
+Its signed-in page has a **Policy enforcement** tab (`/?tab=pep`) showing what the PEP reports, refreshed every two seconds:
+
+- **Decisions:** how many, allowed, denied, unavailable, stopped by an obligation, and the mean and slowest time per decision (plus the Permit cache in `central` mode).
+- **Cached policy:** policies held, when the cached policy last changed, the last and the next scheduled pull, pulls (changed, failed), policy-change events, the catalogue claims sent, and the policy set's and catalogue's versions.
+- **The PEP:** name, mode, application, iya-sts, registered, running and uptime, whether the stream carries policy-change events, the protocol version and the key's thumbprint.
+- **Control plane:** heartbeats (last, next, failed), registrations, and decision records queued, sent and dropped.
+
+`GET /pep-status` answers the same as JSON for a dashboard of your own. Every number comes from `pep().unwrap().status()`, which your application can read the same way.
+
 ## See also
 
 - [`iya-pep`'s README](https://github.com/rcbj/iya-pep-rust#readme): the crate's own API and every configuration member.

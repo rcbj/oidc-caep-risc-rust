@@ -78,7 +78,7 @@ match rp.decide_session(&session_id, &Access::new("read", "order", "42")) {
 }
 ```
 
-The section is off unless present, and a build without the feature refuses it. The PEP's key must be its own, and only the claims the realm's AuthZEN catalogue declares are sent. The demo protects `GET /orders/<id>` with the PEP.
+The section is off unless present, and a build without the feature refuses it. The PEP's key must be its own, and only the claims the realm's AuthZEN catalogue declares are sent. The demo protects `GET /orders/<id>` with the PEP, and its **Policy enforcement** tab (`/?tab=pep`, or `GET /pep-status` as JSON) shows the PEP's counters and timers live.
 
 ## Tests
 
