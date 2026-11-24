@@ -240,6 +240,8 @@ Its signed-in page has a **Policy enforcement** tab (`/?tab=pep`) showing what t
 
 `GET /pep-status` answers the same as JSON for a dashboard of your own. Every number comes from `pep().unwrap().status()`, which your application can read the same way.
 
+**The AuthZEN tests** hold the two modes to one answer. `src/tests/authzen_cases.json` is a table of catalogue rows, policies and 54 cases (a sign-in's claims, an `Access`, and the answer the host must see). `cargo test` runs every case through a `local` PEP against a stub PDP. `python3 scripts/live_iya_sts.py --authzen` provisions a fresh iya-sts with one `central` and one `local` PEP per application and fails on any case where the two answer differently, or differently from the table. It found two differences for an application that enforces fine-grained authorization: `central` answered `Unavailable` (the service's 500) wherever that application's policy reached a policy it references, and `local` missed the `urn:sts:xacml:fga:stage` fact the service adds. Both are fixed (iya-sts's `decideAccess()` resolves the references a local PEP is sent, and iya-pep adds the two FGA facts), and the live run is 54 of 54. Two more things are held equal by iya-pep: advice reaches a `central` PEP only while the realm's `authzen.returnReasons` is on, and a `local` PEP writes the caller fact (`urn:sts:xacml:authzen:caller`) as its entry's DN, which the registration answers, as the service does.
+
 ## See also
 
 - [`iya-pep`'s README](https://github.com/rcbj/iya-pep-rust#readme): the crate's own API and every configuration member.
