@@ -21,9 +21,118 @@ struct Session {
     expires: f64,
 }
 
+/// One received Shared Signals event, as the CAEP & RISC events tab draws
+/// it and `app.js` receives it from `/api/signals`.
+#[derive(Clone)]
 struct LiveEvent {
+    id: u64,
     event_type: String,
     jti: Option<String>,
+    /// CAEP, RISC, SSF (the stream's own) or STS (iya-sts's own).
+    family: String,
+    at: String,
+    subject: String,
+    members: Value,
+    ended: bool,
+}
+
+/// The most events kept; the oldest go first.
+const MAX_EVENTS: usize = 200;
+
+/// The family a SET event type belongs to, for its badge.
+fn family_of(event_type: &str) -> &'static str {
+    if event_type.contains("/caep/") {
+        "CAEP"
+    } else if event_type.contains("/risc/") {
+        "RISC"
+    } else if event_type.contains("/ssf/") {
+        "SSF"
+    } else {
+        "STS"
+    }
+}
+
+/// A UTC timestamp, `YYYY-MM-DD HH:MM:SS UTC`.
+fn utc(secs: f64) -> String {
+    let t = secs.max(0.0) as i64;
+    let (days, rem) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+fn event_json(event: &LiveEvent) -> Value {
+    json!({
+        "id": event.id, "type": event.event_type, "jti": event.jti, "family": event.family,
+        "at": event.at, "subject": event.subject, "members": event.members, "ended": event.ended,
+        "about": if event.family == "SSF" { "stream" } else { "subject" },
+    })
+}
+
+/// One log entry: the same markup `app.js`'s `entryNode()` draws.
+fn event_item(event: &LiveEvent) -> String {
+    let short = event.event_type.rsplit("/event-type/").next().unwrap_or(&event.event_type);
+    let outcome = if event.family == "SSF" {
+        "about the stream: the verification this session asked for"
+    } else if event.ended {
+        "ended this session"
+    } else {
+        "recorded; this session continues"
+    };
+    let mut out = format!(
+        "<li class=\"log-item\" data-id=\"{}\"><div class=\"log-top\"><span class=\"badge {}\">{}</span> <strong>{}</strong> <time>{}</time></div><p class=\"log-outcome{}\">{}</p>",
+        event.id,
+        esc(&event.family.to_lowercase()),
+        esc(&event.family),
+        esc(short),
+        esc(&event.at),
+        if event.ended { " ended" } else { "" },
+        outcome
+    );
+    if !event.subject.is_empty() {
+        out.push_str(&format!("<p><small>Subject: {}</small></p>", esc(&event.subject)));
+    }
+    if let Some(members) = event.members.as_object().filter(|m| !m.is_empty()) {
+        out.push_str("<table class=\"facts members\">");
+        for (name, value) in members {
+            if name == "subject" {
+                continue;
+            }
+            let text = match value {
+                Value::String(s) => s.clone(),
+                Value::Object(o) if !o.is_empty() && o.values().all(|v| v.is_string()) => o.values().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" / "),
+                other => other.to_string(),
+            };
+            out.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", esc(name), esc(&text)));
+        }
+        out.push_str("</table>");
+    }
+    out.push_str(&format!("<p><small>jti {}</small></p></li>", esc(event.jti.as_deref().unwrap_or(""))));
+    out
+}
+
+/// The CAEP & RISC events tab: the stream, the verification request and the
+/// log, newest first. `app.js` adds what arrives without reloading.
+fn events_panel(events: &[LiveEvent], stream: &str, notice: &str) -> String {
+    let items: String = events.iter().rev().map(event_item).collect();
+    let notice = if notice.is_empty() { String::new() } else { format!("<p class=\"notice\">{}</p>", esc(notice)) };
+    format!(
+        "{notice}<table class=\"facts\"><tr><th>Stream status</th><td id=\"stream-status\">{}</td></tr></table>\
+<form id=\"verify-form\" method=\"post\" action=\"/signals/verify\"><button type=\"submit\">Ask for a verification event</button></form>\
+<p><small>The CAEP and RISC events this application's receiver has accepted, newest first, and the verification events it asked for. Each appears here within moments of the receiver getting it: <span id=\"live-state\">connecting…</span></small></p>\
+<ul class=\"log\" id=\"log\">{items}</ul>\
+<p class=\"empty\" id=\"log-empty\"{}>No CAEP or RISC event yet. At iya-sts, change this person's password (credential-change), sign them out (session-revoked), or disable them (account-disabled), and watch this tab.</p>",
+        esc(stream),
+        if events.is_empty() { "" } else { " hidden" }
+    )
 }
 
 struct App {
@@ -39,6 +148,7 @@ struct App {
     receiver: Mutex<Option<SignalsReceiver>>,
     state: Mutex<String>,
     events: Mutex<Vec<LiveEvent>>,
+    event_seq: std::sync::atomic::AtomicU64,
 }
 
 fn main() {
@@ -93,6 +203,7 @@ fn main() {
         receiver: Mutex::new(None),
         state: Mutex::new(String::new()),
         events: Mutex::new(Vec::new()),
+        event_seq: std::sync::atomic::AtomicU64::new(0),
     });
     let server = tiny_http::Server::http(format!("0.0.0.0:{port}")).expect("bind");
     println!("oidc-caep-risc-rust demo on port {port}");
@@ -135,6 +246,20 @@ fn route(app: Arc<App>, request: Request) {
     }
     if path == "/" && method == Method::Get {
         home(&app, request);
+        return;
+    }
+    if path == "/api/signals" && method == Method::Get {
+        signals_api(&app, request);
+        return;
+    }
+    if path == "/events" && method == Method::Get {
+        // No Server-Sent Events here: 204 tells app.js's EventSource to give
+        // up, and it polls /api/signals every 3 s instead.
+        respond(request, 204, "text/plain", "", &[]);
+        return;
+    }
+    if path == "/signals/verify" && method == Method::Post {
+        verify_signals(&app, request);
         return;
     }
     if path == "/login" && method == Method::Get {
@@ -215,18 +340,36 @@ fn home(app: &Arc<App>, request: Request) {
         rows.push_str(&format!("<tr><th>Access token</th><td>{}</td></tr>", esc(&token)));
         let session_body = format!("<table class=\"facts\">{rows}</table><p><small>The access token and the refresh token stay in this process. This page does not show them.</small></p><p><small>Shared Signals: {}</small></p>", esc(&app.state.lock().unwrap()));
         let tab = query_param(request.url(), "tab");
-        let pep_tab = tab == "pep";
-        let selected = |on: bool| if on { "true" } else { "false" };
-        let content = if pep_tab {
-            format!("<div id=\"pep-panel\" aria-live=\"polite\">{}</div><script src=\"/pep.js\" defer></script>", pep_fragment(rp.as_ref()))
-        } else {
-            session_body
+        let tab = match tab.as_str() {
+            "pep" | "events" => tab,
+            _ => "session".to_string(),
         };
+        let events = app.events.lock().unwrap().clone();
+        let last_id = events.last().map(|e| e.id).unwrap_or(0);
+        let content = match tab.as_str() {
+            "pep" => format!("<div id=\"pep-panel\" aria-live=\"polite\">{}</div><script src=\"/pep.js\" defer></script>", pep_fragment(rp.as_ref())),
+            "events" => {
+                let notice = match query_param(request.url(), "verify").as_str() {
+                    "sent" => "A verification event was requested; it appears below when the transmitter sends it.",
+                    "refused" => "The transmitter refused the verification request.",
+                    _ => "",
+                };
+                events_panel(&events, &app.state.lock().unwrap(), notice)
+            }
+            _ => session_body,
+        };
+        let tab_link = |id: &str, href: &str, label: &str| {
+            let on = id == tab;
+            format!("<a class=\"page-tab\" role=\"tab\" href=\"{href}\" aria-selected=\"{on}\"{}>{label}</a>", if on { " aria-current=\"page\"" } else { "" })
+        };
+        let count = if events.is_empty() { String::new() } else { events.len().to_string() };
         let body = format!(
-            "<h1>Signed in as {}</h1><nav class=\"page-tabs\" role=\"tablist\"><a class=\"page-tab\" role=\"tab\" href=\"/\" aria-selected=\"{}\">Session</a><a class=\"page-tab\" role=\"tab\" href=\"/?tab=pep\" aria-selected=\"{}\">Policy enforcement</a></nav>{content}<form method=\"post\" action=\"/logout\"><button type=\"submit\">Sign out</button></form>",
+            "<h1>Signed in as {}</h1><nav class=\"page-tabs\" role=\"tablist\" aria-label=\"Sections\">{}{}{}</nav><p id=\"signal-banner\" class=\"problem\" hidden></p><p id=\"signal-toast\" class=\"notice\" hidden></p><div role=\"tabpanel\" id=\"panel\" data-base=\"\" data-tab=\"{}\" data-last-id=\"{last_id}\">{content}</div><form method=\"post\" action=\"/logout\"><button type=\"submit\">Sign out</button></form><script src=\"/app.js\" defer></script>",
             esc(&who),
-            selected(!pep_tab),
-            selected(pep_tab)
+            tab_link("session", "/", "Session"),
+            tab_link("events", "/?tab=events", &format!("CAEP &amp; RISC events <span class=\"count\" id=\"signal-count\">{count}</span>")),
+            tab_link("pep", "/?tab=pep", "Policy enforcement"),
+            esc(&tab)
         );
         respond(request, 200, "text/html; charset=utf-8", &page("Signed in", &body), &[]);
         return;
@@ -256,6 +399,7 @@ fn live_status(app: &Arc<App>, request: Request) {
         if who.is_empty() { None } else { Some(who) }
     });
     let events = app.events.lock().unwrap().iter().map(|event| json!({"type": event.event_type, "jti": event.jti})).collect::<Vec<_>>();
+
     #[allow(unused_mut)]
     let mut body = json!({
         "signedIn": session.is_some(),
@@ -479,10 +623,65 @@ fn start_receiver(app: &Arc<App>) {
     }
 }
 
+/// `GET /api/signals?after=<id>`: what arrived after the last event the
+/// page shows, and the stream's state. 401 once the session is gone, which
+/// `app.js` reads as signed out.
+fn signals_api(app: &Arc<App>, request: Request) {
+    if session_of(app, &request).is_none() {
+        respond(request, 401, "application/json", &json!({"signedIn": false}).to_string(), &[]);
+        return;
+    }
+    let after = query_param(request.url(), "after").parse::<u64>().unwrap_or(0);
+    let events: Vec<Value> = app.events.lock().unwrap().iter().filter(|e| e.id > after).map(event_json).collect();
+    let body = json!({"events": events, "streamStatus": {"status": app.state.lock().unwrap().clone(), "at": utc(now())}});
+    respond(request, 200, "application/json", &body.to_string(), &[]);
+}
+
+/// `POST /signals/verify`: asks the transmitter for a verification event on
+/// the stream. JSON for `app.js`, a redirect back to the tab without it.
+fn verify_signals(app: &Arc<App>, request: Request) {
+    if session_of(app, &request).is_none() {
+        redirect(request, 303, "/", &[]);
+        return;
+    }
+    let state = format!("demo-{}", app.event_seq.load(std::sync::atomic::Ordering::Relaxed) + 1);
+    let outcome = match app.receiver.lock().unwrap().as_ref().map(|r| r.verify(&state)) {
+        Some(Ok(())) => "sent",
+        Some(Err(err)) => {
+            eprintln!("ssf: verification request refused: {err}");
+            "refused"
+        }
+        None => "refused",
+    };
+    let wants_json = request.headers().iter().any(|h| h.field.equiv("accept") && h.value.as_str().contains("application/json"));
+    if wants_json {
+        respond(request, 200, "application/json", &json!({"outcome": outcome}).to_string(), &[]);
+    } else {
+        redirect(request, 303, &format!("/?tab=events&verify={outcome}"), &[]);
+    }
+}
+
 fn remember_live_event(app: &Arc<App>, event: SignalEvent) {
     let event_type = event.event_type;
     let jti = if event.jti.is_empty() { None } else { Some(event.jti) };
-    app.events.lock().unwrap().push(LiveEvent { event_type: event_type.clone(), jti });
+    let mut subject: Vec<String> = event.subject.iter().map(|(k, v)| format!("{k} {v}")).collect();
+    subject.sort();
+    let live = LiveEvent {
+        id: app.event_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        event_type: event_type.clone(),
+        jti,
+        family: family_of(&event_type).to_string(),
+        at: utc(event.iat.unwrap_or_else(now)),
+        subject: subject.join(", "),
+        members: Value::Object(event.payload.clone().into_iter().collect()),
+        ended: event.ended,
+    };
+    {
+        let mut events = app.events.lock().unwrap();
+        events.push(live);
+        let over = events.len().saturating_sub(MAX_EVENTS);
+        events.drain(..over);
+    }
     // The receiver drops a session only when the event's IdP session id matches.
     // A session-revoked that names a different id leaves this demo's one login in place.
     if event_type != Event::get("sessionRevoked") || !event.sessions.is_empty() {
@@ -545,7 +744,7 @@ fn respond(request: Request, status: u16, content_type: &str, body: &str, cookie
     let _ = response.add_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
     let _ = response.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
     let _ = response.add_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap());
-    let _ = response.add_header(Header::from_bytes("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'").unwrap());
+    let _ = response.add_header(Header::from_bytes("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'").unwrap());
     for cookie in cookies {
         let _ = response.add_header(Header::from_bytes("Set-Cookie", cookie.as_str()).unwrap());
     }
@@ -840,6 +1039,46 @@ fn move_origin(value: &str, public: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live(id: u64, event_type: &str, ended: bool) -> LiveEvent {
+        LiveEvent {
+            id,
+            event_type: event_type.into(),
+            jti: Some(format!("j<{id}>")),
+            family: family_of(event_type).into(),
+            at: utc(1_795_000_000.0),
+            subject: "format email, email <a@x>".into(),
+            members: json!({"reason_admin": {"en": "<b>gone</b>"}, "subject": {"x": 1}}),
+            ended,
+        }
+    }
+
+    #[test]
+    fn the_events_tab_draws_each_event_newest_first_and_escapes() {
+        let caep = "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
+        let risc = "https://schemas.openid.net/secevent/risc/event-type/account-disabled";
+        let html = events_panel(&[live(1, caep, true), live(2, risc, false)], "polling <s>", "");
+        assert!(html.find("data-id=\"2\"").unwrap() < html.find("data-id=\"1\"").unwrap(), "newest first");
+        assert!(html.contains("<span class=\"badge caep\">CAEP</span> <strong>session-revoked</strong>"));
+        assert!(html.contains("<span class=\"badge risc\">RISC</span>"));
+        assert!(html.contains("ended this session") && html.contains("recorded; this session continues"));
+        assert!(html.contains("&lt;b&gt;gone&lt;/b&gt;") && !html.contains("<b>gone"), "members escaped");
+        assert!(html.contains("polling &lt;s&gt;") && html.contains("j&lt;1&gt;"));
+        assert!(html.contains("id=\"log-empty\" hidden"), "the empty note hidden once there are events");
+        assert!(events_panel(&[], "", "").contains("id=\"log-empty\">"), "and shown when there are none");
+        assert!(!html.contains(">subject<"), "the subject member is the Subject line, not a row");
+    }
+
+    #[test]
+    fn an_event_is_handed_to_app_js_in_the_shape_it_reads() {
+        let e = event_json(&live(7, "https://schemas.openid.net/secevent/ssf/event-type/verification", false));
+        assert_eq!(e["id"], 7);
+        assert_eq!(e["family"], "SSF");
+        assert_eq!(e["about"], "stream");
+        assert_eq!(family_of("urn:iya:sts:secevent:event-type:pep-policies-changed"), "STS");
+        assert_eq!(utc(0.0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc(1_795_000_000.0), "2026-11-18 11:06:40 UTC");
+    }
 
     #[test]
     fn query_param_reads_one_parameter() {
