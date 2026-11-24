@@ -47,6 +47,9 @@ must turn into a 403 within PEP_FLIP_TIMEOUT seconds (30) through the
 pep-policies-changed event, with the fallback poll left at its 300 s default
 so the poll cannot be what did it. The result's pep object holds each check.
 
+--authzen (or LIVE_AUTHZEN=1) runs scripts/live_authzen.py instead: the AuthZEN
+differential, central against local over src/tests/authzen_cases.json.
+
 Secrets reach docker and the install script as -e NAME and through the
 environment, never on a command line. No log line carries a URL from the
 sign-in (its query and path hold opaque handles, and some answer requests that
@@ -780,7 +783,7 @@ def flip_check(driver, client, sts_origin, token):
     return result
 
 
-def prepare_sts(sts_port, secret):
+def prepare_sts(sts_port, secret, name=None):
     given = os.environ.get("IYA_STS_URL", "").rstrip("/")
     if given:
         print(f"using {given}", flush=True)
@@ -798,7 +801,7 @@ def prepare_sts(sts_port, secret):
             source = cloned
         image = "iya-sts-live:main"
         docker("build", "-t", image, source)
-    name = "iya-sts-live-" + PROFILE["repo"]
+    name = name or "iya-sts-live-" + PROFILE["repo"]
     docker_rm(name)
     docker(
         "run", "-d", "--name", name,
@@ -871,6 +874,10 @@ def start_demo(image, demo_name, demo_port, demo_origin, mounts, env=None):
 
 
 def main():
+    if "--authzen" in sys.argv[1:] or os.environ.get("LIVE_AUTHZEN", "") in ("1", "true", "yes"):
+        # The AuthZEN differential (#46): its own iya-sts, no demo, no sign-in.
+        import live_authzen
+        return live_authzen.main()
     pep = "--pep" in sys.argv[1:] or os.environ.get("LIVE_PEP", "") in ("1", "true", "yes")
     sts_port = int(os.environ.get("LIVE_STS_PORT") or 18516)
     demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18616)

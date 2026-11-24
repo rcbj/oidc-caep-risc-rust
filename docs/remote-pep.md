@@ -231,6 +231,8 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 
 Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/oidc.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
 
+**The AuthZEN tests** hold the two modes to one answer. `src/tests/authzen_cases.json` is a table of catalogue rows, policies and 54 cases (a sign-in's claims, an `Access`, and the answer the host must see). `cargo test` runs every case through a `local` PEP against a stub PDP. `python3 scripts/live_iya_sts.py --authzen` provisions a fresh iya-sts with one `central` and one `local` PEP per application and fails on any case where the two answer differently, or differently from the table. Against iya-sts #2026–#2028 it finds two differences, both for an application that enforces fine-grained authorization: `central` answers `Unavailable` (the service's 500) wherever that application's policy reaches a policy it references, and `local` misses the `urn:sts:xacml:fga:stage` fact the service adds. Until both are fixed, don't let such an application's policy reference another policy or read those facts.
+
 ## See also
 
 - [`iya-pep`'s README](https://github.com/rcbj/iya-pep-rust#readme): the crate's own API and every configuration member.
