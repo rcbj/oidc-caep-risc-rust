@@ -15,7 +15,7 @@ COPY src src
 # include_str!), so a new trust chain does not rebuild it.
 COPY demo/main.rs demo/main.rs
 COPY demo/public demo/public
-RUN cargo build --release --bin demo
+RUN cargo build --release --features local --bin demo
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends python3 openssl curl ca-certificates && rm -rf /var/lib/apt/lists/*

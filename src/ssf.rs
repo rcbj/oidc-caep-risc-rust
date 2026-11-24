@@ -414,7 +414,28 @@ impl SignalsReceiver {
         if transmitter.is_empty() || !(transmitter.starts_with("http://") || transmitter.starts_with("https://")) {
             return Err(OidcError::new("config", "transmitter must be an http(s) URL"));
         }
-        let events = if opts.events_requested.is_empty() { default_events_requested() } else { opts.events_requested };
+        #[allow(unused_mut)]
+        let mut events = if opts.events_requested.is_empty() { default_events_requested() } else { opts.events_requested };
+        // The embedded PEP's policy events ride this stream (iya-sts#1206 D4).
+        #[cfg(feature = "pep")]
+        let pep = opts.relying_party.as_ref().and_then(|rp| rp.pep().cloned()).filter(|pep| crate::pep::wants_events(pep));
+        #[cfg(feature = "pep")]
+        if pep.is_some() && !events.iter().any(|e| e == crate::pep::POLICIES_CHANGED_EVENT) {
+            events.push(crate::pep::POLICIES_CHANGED_EVENT.to_string());
+        }
+        #[cfg(feature = "pep")]
+        let mut handlers: HashMap<String, Vec<Arc<dyn Fn(SignalEvent) + Send + Sync>>> = HashMap::new();
+        #[cfg(not(feature = "pep"))]
+        let handlers: HashMap<String, Vec<Arc<dyn Fn(SignalEvent) + Send + Sync>>> = HashMap::new();
+        #[cfg(feature = "pep")]
+        if let Some(pep) = pep {
+            // The SET was verified like every other before a handler sees it;
+            // the PEP treats the event as a hint and pulls with its own token.
+            let handler: Arc<dyn Fn(SignalEvent) + Send + Sync> = Arc::new(move |event: SignalEvent| {
+                pep.on_policy_event(&Value::Object(event.payload));
+            });
+            handlers.insert(crate::pep::POLICIES_CHANGED_EVENT.to_string(), vec![handler]);
+        }
         let end_on = if opts.end_on.is_empty() { default_ending_events() } else { opts.end_on };
         let poll = if opts.poll_interval_ms <= 0 { 5000 } else { opts.poll_interval_ms };
         let max_events = if opts.max_events <= 0 { 50 } else { opts.max_events };
@@ -440,7 +461,7 @@ impl SignalsReceiver {
                 running: false,
                 ack: Vec::new(),
                 errs: Map::new(),
-                handlers: HashMap::new(),
+                handlers,
                 inflight_done: true,
                 inflight: None,
                 health: ReceiverHealth { poll_interval_ms: poll, ..ReceiverHealth::default() },
@@ -448,6 +469,11 @@ impl SignalsReceiver {
             stop: Arc::new((Mutex::new(false), Condvar::new())),
             thread: Mutex::new(None),
         })
+    }
+
+    /// The event types this receiver asks its stream for.
+    pub fn events_requested(&self) -> &[String] {
+        &self.events_requested
     }
 
     pub fn stream(&self) -> Option<JsonMap> {

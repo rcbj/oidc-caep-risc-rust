@@ -29,11 +29,18 @@ tiny_http = "0.12"
 tokio = { version = "1", features = ["rt"], optional = true }
 ureq = { version = "2.12", default-features = false, features = ["tls", "native-tls"] }
 url = "2"
+# The embedded iya-sts PEP (the `pep` feature; iya-sts#1206).
+iya-pep = { git = "https://github.com/rcbj/iya-pep-rust", branch = "feature/1", optional = true }
 
 [features]
 # The async API (`create_async`, `complete_session_async`, `start_async`, ...),
 # for an application on a tokio runtime. See src/async_api.rs.
-tokio = ["dep:tokio"]
+tokio = ["dep:tokio", "iya-pep?/tokio"]
+# The embedded iya-sts PEP in `central` mode: every decision is an AuthZEN
+# evaluation at the service.
+pep = ["dep:iya-pep"]
+# `local` mode too: the PEP's XACML engine decides in process.
+local = ["pep", "iya-pep/local"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

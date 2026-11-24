@@ -12,6 +12,18 @@ Issue #18 (shared with the six sibling libraries, same keys and defaults): `dpop
 
 The reverse-proxy gaps (iya-sts's remote PEP, rcbj/iya-sts#1760), 0.3.0: `MemorySessionStore` is bounded (`sessionMaxEntries` 10000, `sessionTtlSec` 86400, both through `apply_defaults`; oldest-written evicted, expired never answered; `stats()`); `SignalsReceiver::health()` (`ReceiverHealth`), `ReceiverOptions::on_error`, a `stop()` woken by a condvar, and one poll thread with no thread spawned per poll; the `tokio` feature (`src/async_api.rs`), `spawn_blocking` around the same blocking calls, not a second HTTP stack. No TLS-verification skip was added: `tlsCa` with the listener's chain is the answer to a CA regenerated on every start. The tests are `src/proxy_gaps_test.rs`. 0.3.0 rather than 0.2.2 because the default store now evicts, which a 0.2 caller did not agree to. Whether the six siblings get the same bounded store and receiver health is issue #18's business; only this library changed.
 
+The embedded PEP (#46, iya-sts#1206 work item 7), behind the `pep` feature (`local` adds the engine): `src/pep.rs` wires in the shared `iya-pep` crate (rcbj/iya-pep-rust).
+- `RelyingParty::create` builds and starts it from the `pep` section:
+  - `pdpUrl` defaults to the issuer and `application` to `clientId`;
+  - `signals` and `tlsCa` are the library's;
+  - it refuses an assertion key that is the `private_key_jwt` or DPoP key (by JWK thumbprint).
+- Without the feature, a `pep` section is refused rather than ignored.
+- `decide` / `decide_session` adapt a `Login` (`preferred_username`, else `sub`; the ID token claims) into the PEP's subject.
+- `SignalsReceiver::new` adds `pep-policies-changed` to `events_requested` and registers the hand-over when the relying party's PEP wants events (`local`, or `central` with a Permit cache).
+- `src/pep_test.rs` has its own stub PDP, and reuses `profile_test.rs`'s provider for the receiver test.
+- **The dependency is a git dependency on iya-pep-rust's `feature/1`** until that crate's first release. Switch it to the crates.io version then, because crates.io refuses a git dependency at publish.
+- The live test of the PEP waits for iya-sts #2026–#2028.
+
 ## Layout
 
 | Path | What it is |
@@ -19,6 +31,7 @@ The reverse-proxy gaps (iya-sts's remote PEP, rcbj/iya-sts#1760), 0.3.0: `Memory
 | crate `oidc-caep-risc` | The library. `from_file`, `authorize`, `complete`. |
 | `src/suite.rs` | `cargo test`. A stub provider and a stub transmitter. No live iya-sts. |
 | `src/profile_test.rs` | Issue #18's tests: DPoP, acr, PAR required, algorithms, typ/at_hash, creation defaults, the session cache. |
+| `src/pep_test.rs` | #46: the `pep` section and its defaults, the three-key refusal, the `Login` adapter, `decide`/`decide_session` against a stub PDP, the event through `SignalsReceiver`, `local` failing closed and then deciding in process. |
 | `src/proxy_gaps_test.rs` | The bounded store, receiver health, prompt stop, `on_error`, and (feature `tokio`) the async API. |
 | `src/trust_chain_test.rs` | The trust chain: the registrar writes all four certificates; the library trusts the file, refuses the leaf alone, a wrong host name, and a foreign leaf sent with the real CA certificates. |
 | `demo` | `demo/main.rs` and `demo/public/`. Config is `demo/oidc.json`. |

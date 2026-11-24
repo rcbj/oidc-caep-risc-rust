@@ -128,7 +128,7 @@ fn sign_jwt(alg: &str, typ: Option<&str>, payload: &Value) -> String {
 // ---- a configurable stub provider -------------------------------------------------
 
 #[derive(Clone)]
-struct OpCfg {
+pub(crate) struct OpCfg {
     advertised: Vec<String>,
     dpop_algs: Option<Vec<String>>,
     par: bool,
@@ -179,7 +179,7 @@ struct Seen {
     proof_jkt: Option<String>,
 }
 
-struct Op {
+pub(crate) struct Op {
     url: String,
     cfg: Mutex<OpCfg>,
     codes: Mutex<HashMap<String, HashMap<String, String>>>,
@@ -194,7 +194,7 @@ struct Op {
 const AS_NONCE: &str = "as-nonce-1";
 const RS_NONCE: &str = "rs-nonce-1";
 
-fn start_op(cfg: OpCfg) -> &'static Op {
+pub(crate) fn start_op(cfg: OpCfg) -> &'static Op {
     // Make every key before the stub answers: generating them inside a request (an RSA
     // and a P-521 key in a debug build) can outlast the client's HTTP timeout on a busy machine.
     alg_keys();
@@ -435,7 +435,7 @@ fn base(op: &Op, over: Value) -> JsonMap {
     doc.as_object().cloned().unwrap()
 }
 
-fn rp_for(op: &Op, over: Value) -> RelyingParty {
+pub(crate) fn rp_for(op: &Op, over: Value) -> RelyingParty {
     RelyingParty::create(base(op, over)).unwrap()
 }
 
@@ -459,7 +459,7 @@ fn last(op: &Op, path: &str) -> Seen {
     seen(op, path).pop().unwrap_or_else(|| panic!("no request to {path}"))
 }
 
-fn dpop_cfg() -> OpCfg {
+pub(crate) fn dpop_cfg() -> OpCfg {
     OpCfg { dpop_algs: Some(vec!["ES256".into(), "RS256".into()]), ..OpCfg::default() }
 }
 

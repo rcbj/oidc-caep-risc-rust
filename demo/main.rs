@@ -140,7 +140,47 @@ fn route(app: Arc<App>, request: Request) {
         logout(&app, request);
         return;
     }
+    #[cfg(feature = "pep")]
+    if let Some(id) = path.strip_prefix("/orders/").filter(|id| !id.is_empty() && !id.contains('/')) {
+        let id = id.to_string();
+        order(&app, request, &method, &id);
+        return;
+    }
     respond(request, 404, "text/html; charset=utf-8", &page("Not found", "<h1>Not found</h1>"), &[]);
+}
+
+/// A route the embedded PEP protects (the `pep` feature, iya-sts#1206): the
+/// signed-in person's access to one order, decided by the `pep` section's
+/// PEP. A GET is `read` and anything else `write`. No sign-in is 401, a
+/// Deny 403, and a decision that couldn't be made 503: never served.
+#[cfg(feature = "pep")]
+fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
+    use oidc_caep_risc::pep::{Access, Decision};
+    let Some(session) = session_of(app, &request) else {
+        respond(request, 401, "text/html; charset=utf-8", &page("Sign in", "<h1>Sign in first</h1><p><a href=\"/login\">Sign in</a></p>"), &[]);
+        return;
+    };
+    let (rp, _) = relying_party(app);
+    let Some(rp) = rp else {
+        respond(request, 503, "text/html; charset=utf-8", &page("Unavailable", "<h1>The relying party is not configured</h1>"), &[]);
+        return;
+    };
+    let action = if *method == Method::Get { "read" } else { "write" };
+    match rp.decide(&session.login, &Access::new(action, "order", id)) {
+        Decision::Permit { obligations, .. } => {
+            let note = if obligations.is_empty() { String::new() } else { format!("<p><small>{} obligation(s) to discharge.</small></p>", obligations.len()) };
+            let body = format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", esc(id));
+            respond(request, 200, "text/html; charset=utf-8", &page("Order", &body), &[]);
+        }
+        Decision::Deny { why } => {
+            let body = format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", esc(id), esc(&why));
+            respond(request, 403, "text/html; charset=utf-8", &page("Forbidden", &body), &[]);
+        }
+        Decision::Unavailable { why } => {
+            let body = format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why));
+            respond(request, 503, "text/html; charset=utf-8", &page("Unavailable", &body), &[]);
+        }
+    }
 }
 
 fn home(app: &Arc<App>, request: Request) {

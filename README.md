@@ -57,6 +57,34 @@ With DPoP in use, the relying party sends `dpop_jkt` on the authorization reques
 
 With `features = ["tokio"]`, every call that can reach the network has an `_async` twin: `RelyingParty::create_async`, `from_file_async`, `authorize_async`, `complete_async`, `complete_session_async`, `session_access_token_async`, `refresh_async`, `client_credentials_async`, `userinfo_async`, and `SignalsReceiver::start_async`, `stop_async`, `poll_once_async` (the methods take `self: &Arc<Self>`). They run the blocking call on tokio's blocking pool, so no runtime worker thread waits on the network. The HTTP client is still `ureq`: each call holds one blocking-pool thread for as long as it takes (at most the 15 s timeout per request), and dropping the future does not cancel the request. `session`, `remove_session`, `health`, `track` and `untrack` never touch the network and stay synchronous.
 
+## Embedded PEP (features `pep` and `local`)
+
+The [iya-pep](https://github.com/rcbj/iya-pep-rust) crate, wired in (iya-sts [#1206](https://github.com/rcbj/iya-sts/issues/1206)): an application asks iya-sts's policy whether a signed-in person may act on a resource.
+
+```toml
+oidc-caep-risc = { version = "…", features = ["pep"] }    # central: AuthZEN at iya-sts
+oidc-caep-risc = { version = "…", features = ["local"] }  # local too: decided in process
+```
+
+Add a `pep` section to the configuration. It is off unless present:
+
+```json
+"pep": { "name": "pep-orders", "mode": "local", "assertionKey": "generated/pep-key.pem" }
+```
+
+- **Defaults from this library:**
+  - `pdpUrl` is the provider's issuer, with the realm prefix.
+  - `application` is `clientId`.
+  - `signals` and `tlsCa` follow the library's own settings.
+  - iya-pep's README lists every member.
+- **The PEP's key is its own.** `create` refuses a configuration where the assertion key is the `private_key_jwt` key or the DPoP key. Certify the key and bind the PEP to the application with iya-sts's `issue-pep-credential`.
+- **Deciding:**
+  - `rp.decide(&login, &Access::new("read", "order", "42"))`, or `rp.decide_session(session_id, …)`. A session that ended, including by CAEP `session-revoked`, is a Deny.
+  - The subject is the `Login`: `preferred_username` (else `sub`) and its claims. Only the claims the realm's AuthZEN catalogue declares are sent.
+  - The answer is `Permit { obligations, advice }`, `Deny` or `Unavailable`. `Unavailable` means no policy is held yet or the service can't be reached, and is never a Permit.
+- **Signals.** A `SignalsReceiver` built with this relying party asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`: always in `local` mode, and in `central` when `permitCacheMs` is set. It verifies the SET like any other and hands the event to the PEP, which pulls with its own token. With `signals: false`, a `local` PEP polls at `pollIntervalMs`.
+- **The demo** protects `GET /orders/<id>` with the PEP when the image is built with `local` (the Dockerfile does) and `demo/oidc.json` has a `pep` section.
+
 ## Tests
 
 ```bash

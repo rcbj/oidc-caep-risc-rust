@@ -11,6 +11,8 @@ mod error;
 mod http;
 mod idtoken;
 mod keys;
+#[cfg(feature = "pep")]
+pub mod pep;
 mod pkce;
 mod rp;
 mod ssf;
@@ -27,6 +29,8 @@ pub use rp::{Access, AuthorizeOptions, EndSessionOptions, Login, MemorySessionSt
 pub use ssf::{subject_of, verify_compact_jws, Event, ReceiverHealth, ReceiverOptions, SignalEvent, SignalsReceiver};
 pub use value::JsonMap;
 
+#[cfg(all(test, feature = "pep"))]
+mod pep_test;
 #[cfg(test)]
 mod profile_test;
 #[cfg(test)]
