@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use oidc_caep_risc::{is_loopback, resolve_config, Event, Login, ReceiverOptions, RelyingParty, SignalEvent, SignalsReceiver, Transaction};
+use oidc_caep_risc::{is_loopback, resolve_config, Event, Login, MemorySessionStore, ReceiverOptions, RelyingParty, SessionStore, SignalEvent, SignalsReceiver, Transaction, DEFAULT_SESSION_MAX_ENTRIES, DEFAULT_SESSION_TTL_SEC};
 use serde_json::{json, Value};
 use hmac::Mac;
 use sha2::Sha256;
@@ -67,6 +67,217 @@ fn utc(secs: f64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// A JWT's header and claims, decoded (not verified here: the library
+/// verified the ID token, and an access token is the resource server's to
+/// verify). `None` for a token that is not a signed JWT.
+fn decode_jwt(token: &str) -> Option<(Value, Value)> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let part = |p: &str| -> Option<Value> {
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, p.trim_end_matches('=')).ok()?;
+        serde_json::from_slice(&raw).ok()
+    };
+    Some((part(parts[0])?, part(parts[1])?))
+}
+
+/// A short, non-reversible name for a token: what this page shows instead of
+/// the value, which never leaves this process.
+fn fingerprint(token: &str) -> String {
+    let digest = <Sha256 as sha2::Digest>::digest(token.as_bytes());
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("sha256 {hex}…")
+}
+
+/// A claim's value as the Session pane shows it: times read as UTC.
+fn claim_text(name: &str, value: &Value) -> String {
+    match (name, value) {
+        ("iat" | "exp" | "nbf" | "auth_time", Value::Number(n)) => n.as_f64().map(|t| format!("{} ({})", utc(t), n)).unwrap_or_default(),
+        (_, Value::String(s)) => s.clone(),
+        (_, Value::Array(a)) if a.iter().all(|v| v.is_string()) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
+        (_, other) => other.to_string(),
+    }
+}
+
+fn claims_table(claims: &serde_json::Map<String, Value>) -> String {
+    let mut names: Vec<&String> = claims.keys().collect();
+    names.sort();
+    let rows: String = names.iter().map(|n| format!("<tr><th>{}</th><td>{}</td></tr>", esc(n), esc(&claim_text(n, &claims[*n])))).collect();
+    format!("<table class=\"facts\">{rows}</table>")
+}
+
+/// Counts a refresh the library made on its own (the cached expiry moved),
+/// and answers what is known.
+fn note_expiry(app: &Arc<App>, sid: &str, expiry: Option<f64>) -> Refreshes {
+    let mut all = app.refreshes.lock().unwrap();
+    let entry = all.entry(sid.to_string()).or_default();
+    if entry.seen_expiry.is_some() && expiry.is_some() && entry.seen_expiry != expiry {
+        entry.count += 1;
+        entry.last = Some(now());
+    }
+    entry.seen_expiry = expiry;
+    entry.clone()
+}
+
+fn in_words(secs: f64) -> String {
+    let s = secs.abs().round() as i64;
+    let text = if s >= 3600 { format!("{}h {}m", s / 3600, s % 3600 / 60) } else if s >= 60 { format!("{}m {}s", s / 60, s % 60) } else { format!("{s}s") };
+    if secs < 0.0 { format!("{text} ago") } else { text }
+}
+
+fn pane(id: &str, title: &str, aside: &str, body: &str) -> String {
+    let aside = if aside.is_empty() { String::new() } else { format!(" <span class=\"aside\">{}</span>", esc(aside)) };
+    format!("<details class=\"card pane\" id=\"{id}\" open><summary><h2>{}</h2>{aside}</summary>{body}</details>", esc(title))
+}
+
+fn token_block(title: &str, token: &str, note: &str) -> String {
+    if token.is_empty() {
+        return format!("<h3>{}</h3><p><small>None was issued.</small></p>", esc(title));
+    }
+    let note = if note.is_empty() { String::new() } else { format!(" · {}", esc(note)) };
+    let head = format!("<h3>{}</h3><p><small>{}{note}</small></p>", esc(title), esc(&fingerprint(token)));
+    match decode_jwt(token) {
+        Some((header, claims)) => format!(
+            "{head}<p><small>JWT header</small></p><pre class=\"output\">{}</pre><p><small>JWT claims</small></p><pre class=\"output\">{}</pre>",
+            esc(&serde_json::to_string_pretty(&header).unwrap_or_default()),
+            esc(&serde_json::to_string_pretty(&claims).unwrap_or_default())
+        ),
+        None if token.split('.').count() == 5 => format!("{head}<p><small>An encrypted JWT (JWE): only its recipient can read it.</small></p>"),
+        None => format!("{head}<p><small>Opaque to this application: only the issuer can read it (introspection).</small></p>"),
+    }
+}
+
+/// The Session tab: what protects the sign-in, who signed in, the token
+/// cache and the tokens. The tokens' values stay in this process; this page
+/// shows what is in them and a fingerprint, never a value.
+fn session_panes(rp: &RelyingParty, login: &Login, access_problem: Option<String>, refreshes: &Refreshes, userinfo: Option<&str>, stream: &str, notice: &str) -> String {
+    let config = rp.config();
+    let meta = rp.metadata();
+    let get = |k: &str| config.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let par_required = meta.get("require_pushed_authorization_requests") == Some(&Value::Bool(true));
+    let par = match get("par").as_str() {
+        "never" => "off".to_string(),
+        "always" => "on: the request never passes through the browser's URL".to_string(),
+        _ if par_required || meta.get("pushed_authorization_request_endpoint").is_some() => "on (auto): the request never passes through the browser's URL".to_string(),
+        _ => "off (auto: the provider has no PAR endpoint)".to_string(),
+    };
+    let dpop = match rp.dpop_jkt() {
+        Some(jkt) => format!("on (ES256, jkt {}…): tokens bound to this process's key", jkt.chars().take(12).collect::<String>()),
+        None => "off: bearer tokens".to_string(),
+    };
+    let typ = if config.get("requireIdTokenTypAndAtHash") == Some(&Value::Bool(false)) { "" } else { "; typ JWT and at_hash required" };
+    let protections = [
+        ("Confidential client", format!("client authentication {}", get("tokenEndpointAuthMethod"))),
+        ("PKCE", "S256 on every authorization request".to_string()),
+        ("state", "random per request, checked on return".to_string()),
+        ("nonce", "random, checked against the ID token".to_string()),
+        ("Issuer identification", if meta.get("authorization_response_iss_parameter_supported") == Some(&Value::Bool(true)) { "iss checked on the authorization response (RFC 9207)".to_string() } else { "the provider does not send iss on the response".to_string() }),
+        ("Pushed Authorization Requests", par),
+        ("DPoP", dpop),
+        ("ID token", format!("signed with {}{typ}", rp.id_token_algs().join(", "))),
+        ("TLS", if rp.tls_ca().is_some() { "the provider is verified against tlsCa's trust chain".to_string() } else { "the provider is verified against the system's roots".to_string() }),
+        ("Token cache", "server-side, in this process's session cache; never sent to the browser".to_string()),
+        ("Shared Signals", if stream.is_empty() { "not running".to_string() } else { stream.to_string() }),
+    ];
+    let list: String = protections.iter().map(|(k, v)| format!("<li><strong>{}</strong> <span class=\"muted\">{}</span></li>", esc(k), esc(v))).collect();
+    let mut out = String::new();
+    if !notice.is_empty() {
+        out.push_str(&format!("<p class=\"notice\">{}</p>", esc(notice)));
+    }
+    out.push_str(&pane("security-card", "Protections in effect", "", &format!("<ul class=\"checks\">{list}</ul>")));
+    let issued = login.claims.get("auth_time").and_then(|v| v.as_f64()).map(|t| format!("signed in {}", in_words(t - now()))).unwrap_or_default();
+    out.push_str(&pane("session-card", "Session", &issued, &format!("{}<p><small>Every claim of the ID token this sign-in returned, as the library verified it.</small></p>", claims_table(&login.claims))));
+    let at = now();
+    let expiry = login.expires_at.map(|e| format!("{} ({})", in_words(e - at), utc(e))).unwrap_or_else(|| "not stated".into());
+    let auto = login.expires_at.map(|e| in_words((e - oidc_caep_risc::SESSION_REFRESH_MARGIN_SEC - at).max(0.0))).unwrap_or_else(|| "—".into());
+    let last = refreshes.last.map(|t| in_words(t - at)).unwrap_or_else(|| "none yet".into());
+    let status = match &access_problem {
+        None => format!("{} access token, valid", if login.token_type.is_empty() { "Bearer" } else { &login.token_type }),
+        Some(why) => format!("no valid access token ({why})"),
+    };
+    let ui = match userinfo {
+        Some(text) => format!("<pre class=\"output\">{}</pre>", esc(text)),
+        None => String::new(),
+    };
+    let cache = format!(
+        "<table class=\"facts\"><tr><th>Access token</th><td>{}</td></tr><tr><th>Expires in</th><td>{}</td></tr><tr><th>Auto-refresh in</th><td>{} (when {}s or less are left and the page asks for it)</td></tr><tr><th>Last refresh</th><td>{}</td></tr><tr><th>Refreshes</th><td>{}</td></tr><tr><th>Refresh token</th><td>{}</td></tr><tr><th>Scope</th><td>{}</td></tr></table>\
+<form class=\"inline\" method=\"post\" action=\"/session/userinfo\"><button type=\"submit\">Call UserInfo</button></form> \
+<form class=\"inline\" method=\"post\" action=\"/session/refresh\"><button type=\"submit\" class=\"secondary\"{}>Force refresh</button></form>{ui}",
+        esc(&status), esc(&expiry), esc(&auto), oidc_caep_risc::SESSION_REFRESH_MARGIN_SEC, esc(&last), refreshes.count,
+        if login.refresh_token.is_empty() { "none" } else { "held" },
+        esc(&login.scope),
+        if login.refresh_token.is_empty() { " disabled" } else { "" }
+    );
+    out.push_str(&pane("token-card", "Token cache", &format!("{} refresh(es)", refreshes.count), &cache));
+    let bound = if login.token_type.eq_ignore_ascii_case("dpop") { "DPoP-bound" } else { "bearer" };
+    let tokens = format!(
+        "<p><small>As currently cached{}. The values stay in this process: each is shown by a fingerprint, and a JWT by its decoded header and claims.</small></p>{}{}{}",
+        if refreshes.count > 0 { format!(" (after {} refresh(es))", refreshes.count) } else { String::new() },
+        token_block("OAuth 2.0 access token", &login.access_token, bound),
+        token_block("OAuth 2.0 refresh token", &login.refresh_token, ""),
+        token_block("OpenID Connect ID token", &login.id_token, "")
+    );
+    out.push_str(&pane("tokens-card", "Tokens", "", &tokens));
+    out
+}
+
+/// `POST /session/userinfo`: calls UserInfo with the session's access token
+/// and keeps the answer for the Token cache pane.
+fn session_userinfo(app: &Arc<App>, request: Request) {
+    let sid = cookie_value(&request, "oidc_session");
+    let (rp, _) = relying_party(app);
+    let (Some(rp), Some(_)) = (rp, session_of(app, &request)) else {
+        redirect(request, 303, "/", &[]);
+        return;
+    };
+    let answer = rp.session_access_token(&sid).and_then(|access| {
+        let subject = rp.session(&sid).map(|l| l.subject).unwrap_or_default();
+        rp.userinfo(&access.access_token, &access.token_type, &subject)
+    });
+    let text = match answer {
+        Ok(claims) => format!("UserInfo, {}:\n{}", utc(now()), serde_json::to_string_pretty(&Value::Object(claims.into_iter().collect())).unwrap_or_default()),
+        Err(err) => format!("UserInfo refused, {}: {err}", utc(now())),
+    };
+    app.userinfo.lock().unwrap().insert(sid, text);
+    redirect(request, 303, "/?done=userinfo#token-card", &[]);
+}
+
+/// `POST /session/refresh`: refreshes now, whatever is left, and caches the
+/// new tokens.
+fn session_refresh(app: &Arc<App>, request: Request) {
+    let sid = cookie_value(&request, "oidc_session");
+    let (rp, _) = relying_party(app);
+    let store = app.store.lock().unwrap().clone();
+    let (Some(rp), Some(store), Some(_)) = (rp, store, session_of(app, &request)) else {
+        redirect(request, 303, "/", &[]);
+        return;
+    };
+    let Some(login) = rp.session(&sid).filter(|l| !l.refresh_token.is_empty()) else {
+        redirect(request, 303, "/?done=refresh-refused#token-card", &[]);
+        return;
+    };
+    match rp.refresh(&login.refresh_token, "", Some(&login)) {
+        Ok(mut refreshed) => {
+            refreshed.session_id = sid.clone();
+            let expiry = refreshed.expires_at;
+            store.set(&sid, refreshed);
+            let mut all = app.refreshes.lock().unwrap();
+            let entry = all.entry(sid).or_default();
+            entry.count += 1;
+            entry.last = Some(now());
+            entry.seen_expiry = expiry;
+            drop(all);
+            redirect(request, 303, "/?done=refreshed#token-card", &[]);
+        }
+        Err(err) => {
+            eprintln!("demo: forced refresh refused: {err}");
+            app.userinfo.lock().unwrap().insert(sid, format!("Refresh refused, {}: {err}", utc(now())));
+            redirect(request, 303, "/?done=refresh-refused#token-card", &[]);
+        }
+    }
 }
 
 fn event_json(event: &LiveEvent) -> Value {
@@ -149,6 +360,20 @@ struct App {
     state: Mutex<String>,
     events: Mutex<Vec<LiveEvent>>,
     event_seq: std::sync::atomic::AtomicU64,
+    /// The relying party's session cache, the demo's own instance of the
+    /// library's store, so Force refresh can put a refreshed sign-in back.
+    store: Mutex<Option<Arc<MemorySessionStore>>>,
+    /// Per session: refreshes seen, the last one's time, the expiry last seen.
+    refreshes: Mutex<HashMap<String, Refreshes>>,
+    /// Per session: the last UserInfo answer (or why there is none).
+    userinfo: Mutex<HashMap<String, String>>,
+}
+
+#[derive(Clone, Default)]
+struct Refreshes {
+    count: u32,
+    last: Option<f64>,
+    seen_expiry: Option<f64>,
 }
 
 fn main() {
@@ -204,6 +429,9 @@ fn main() {
         state: Mutex::new(String::new()),
         events: Mutex::new(Vec::new()),
         event_seq: std::sync::atomic::AtomicU64::new(0),
+        store: Mutex::new(None),
+        refreshes: Mutex::new(HashMap::new()),
+        userinfo: Mutex::new(HashMap::new()),
     });
     let server = tiny_http::Server::http(format!("0.0.0.0:{port}")).expect("bind");
     println!("oidc-caep-risc-rust demo on port {port}");
@@ -256,6 +484,14 @@ fn route(app: Arc<App>, request: Request) {
         // No Server-Sent Events here: 204 tells app.js's EventSource to give
         // up, and it polls /api/signals every 3 s instead.
         respond(request, 204, "text/plain", "", &[]);
+        return;
+    }
+    if path == "/session/userinfo" && method == Method::Post {
+        session_userinfo(&app, request);
+        return;
+    }
+    if path == "/session/refresh" && method == Method::Post {
+        session_refresh(&app, request);
         return;
     }
     if path == "/signals/verify" && method == Method::Post {
@@ -323,22 +559,25 @@ fn home(app: &Arc<App>, request: Request) {
     if let Some(session) = session {
         let login = &session.login;
         let who = if !login.preferred_username.is_empty() { login.preferred_username.clone() } else if !login.email.is_empty() { login.email.clone() } else { login.subject.clone() };
-        let mut rows = String::new();
-        for (name, value) in [("Subject", login.subject.as_str()), ("Issuer", login.issuer.as_str()), ("Email", login.email.as_str()), ("Name", login.name.as_str()), ("Username", login.preferred_username.as_str())] {
-            if value.is_empty() {
-                continue;
-            }
-            rows.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", esc(name), esc(value)));
-        }
-        // The relying party's session cache answers with a valid access token,
-        // refreshing it (with a DPoP proof when DPoP is in use) when it is close to expiry.
-        let token = match rp.as_ref().map(|rp| rp.session_access_token(&cookie_value(&request, "oidc_session"))) {
-            Some(Ok(access)) => format!("{} access token, valid", access.token_type),
-            Some(Err(err)) => format!("no valid access token ({err})"),
-            None => "no relying party".to_string(),
+        let sid = cookie_value(&request, "oidc_session");
+        let notice = match query_param(request.url(), "done").as_str() {
+            "refreshed" => "The tokens were refreshed.",
+            "refresh-refused" => "The refresh was refused; see the Token cache.",
+            "userinfo" => "UserInfo answered; see the Token cache.",
+            _ => "",
         };
-        rows.push_str(&format!("<tr><th>Access token</th><td>{}</td></tr>", esc(&token)));
-        let session_body = format!("<table class=\"facts\">{rows}</table><p><small>The access token and the refresh token stay in this process. This page does not show them.</small></p><p><small>Shared Signals: {}</small></p>", esc(&app.state.lock().unwrap()));
+        let session_body = match rp.as_ref() {
+            Some(rp) => {
+                // A valid access token first, which refreshes it when it is about to expire.
+                let access = rp.session_access_token(&sid);
+                let cached = rp.session(&sid).unwrap_or_else(|| login.clone());
+                let refreshes = note_expiry(app, &sid, cached.expires_at);
+                let userinfo = app.userinfo.lock().unwrap().get(&sid).cloned();
+                let state = app.state.lock().unwrap().clone();
+                session_panes(rp, &cached, access.err().map(|e| e.to_string()), &refreshes, userinfo.as_deref(), &state, notice)
+            }
+            None => "<p class=\"problem\">No relying party.</p>".to_string(),
+        };
         let tab = query_param(request.url(), "tab");
         let tab = match tab.as_str() {
             "pep" | "events" => tab,
@@ -563,7 +802,15 @@ fn load(app: &Arc<App>) -> Result<RelyingParty, String> {
     }
     let base = std::path::Path::new(&app.config_path).parent().unwrap_or(std::path::Path::new("."));
     let resolved = resolve_config(obj, &base.to_string_lossy()).map_err(|err| err.to_string())?;
-    RelyingParty::create(resolved).map_err(|err| err.to_string())
+    let rp = RelyingParty::create(resolved).map_err(|err| err.to_string())?;
+    // The same store the library builds, with the same limits, held here too.
+    let store = Arc::new(MemorySessionStore::new(
+        rp.config().get("sessionMaxEntries").and_then(|v| v.as_u64()).map_or(DEFAULT_SESSION_MAX_ENTRIES, |n| n as usize),
+        rp.config().get("sessionTtlSec").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_SESSION_TTL_SEC),
+    ));
+    rp.set_session_store(Arc::clone(&store) as Arc<dyn SessionStore>);
+    *app.store.lock().unwrap() = Some(store);
+    Ok(rp)
 }
 
 fn start_receiver(app: &Arc<App>) {
@@ -1078,6 +1325,36 @@ mod tests {
         assert_eq!(family_of("urn:iya:sts:secevent:event-type:pep-policies-changed"), "STS");
         assert_eq!(utc(0.0), "1970-01-01 00:00:00 UTC");
         assert_eq!(utc(1_795_000_000.0), "2026-11-18 11:06:40 UTC");
+    }
+
+    #[test]
+    fn a_jwt_is_decoded_and_anything_else_is_not() {
+        let enc = |v: &Value| base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, v.to_string());
+        let jwt = format!("{}.{}.sig", enc(&json!({"alg": "RS256", "typ": "JWT"})), enc(&json!({"sub": "<s>", "exp": 1_795_000_000})));
+        let (h, c) = decode_jwt(&jwt).expect("a JWT");
+        assert_eq!(h["alg"], "RS256");
+        assert_eq!(c["sub"], "<s>");
+        assert!(decode_jwt("opaque-token").is_none());
+        assert!(decode_jwt("a.b.c.d.e").is_none());
+        let block = token_block("ID token", &jwt, "");
+        assert!(block.contains("&quot;sub&quot;: &quot;&lt;s&gt;&quot;"), "decoded and escaped");
+        assert!(!block.contains(&jwt), "the value itself is never on the page");
+        assert!(block.contains("sha256 "));
+        assert!(token_block("refresh", "opaque-token", "").contains("Opaque"));
+        assert!(token_block("refresh", "", "").contains("None was issued"));
+        assert!(token_block("access", "a.b.c.d.e", "").contains("JWE"));
+    }
+
+    #[test]
+    fn claims_read_as_a_person_reads_them() {
+        let claims = json!({"auth_time": 0, "amr": ["pwd", "hwk"], "name": "<b>"}).as_object().unwrap().clone();
+        let table = claims_table(&claims);
+        assert!(table.contains("1970-01-01 00:00:00 UTC (0)"));
+        assert!(table.contains("pwd, hwk"));
+        assert!(table.contains("&lt;b&gt;"));
+        assert!(table.find(">amr<").unwrap() < table.find(">auth_time<").unwrap(), "sorted by name");
+        assert_eq!(in_words(90.0), "1m 30s");
+        assert_eq!(in_words(-3700.0), "1h 1m ago");
     }
 
     #[test]

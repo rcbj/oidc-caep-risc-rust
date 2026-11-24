@@ -60,3 +60,12 @@ button.secondary { background: transparent; color: var(--accent); }
 .accounts li[aria-current] strong { border-color: var(--accent); color: var(--accent); }
 .accounts-label { color: var(--muted); font-size: 0.875rem; }
 .button.small, button.small { padding: 0.3rem 0.6rem; font-size: 0.875rem; }
+details.card > summary { cursor: pointer; list-style-position: outside; }
+details.card > summary h2 { display: inline; font-size: 1.1rem; margin: 0.5rem 0; }
+details.card > summary .aside { color: var(--muted, #666); font-size: 0.85rem; margin-left: 0.5rem; }
+ul.checks { list-style: none; padding: 0; margin: 0.5rem 0; }
+ul.checks li { padding: 0.25rem 0; border-bottom: 1px solid var(--line); }
+.muted { color: var(--muted, #666); }
+pre.output { white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(127, 127, 127, 0.08); border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem; font-size: 0.82rem; }
+form.inline { display: inline-block; margin: 0.25rem 0.5rem 0.5rem 0; }
+details.card h3 { font-size: 1rem; margin: 1rem 0 0.25rem; }
