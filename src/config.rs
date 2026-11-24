@@ -239,7 +239,7 @@ pub fn resolve_config(raw: &JsonMap, base_dir: &str) -> Result<Resolved, OidcErr
     if let Some(alg) = raw.get("idTokenSignedResponseAlg").filter(|v| !v.is_null()).map(sprint).filter(|v| !v.is_empty()) {
         out.insert("idTokenSignedResponseAlg".into(), Value::String(alg));
     }
-    for key in ["par", "dpop", "idTokenSigningAlgs", "requireIdTokenTypAndAtHash", "acrValues", "clockToleranceSec", "maxIdTokenAgeSec", "sessionMaxEntries", "sessionTtlSec"] {
+    for key in ["par", "dpop", "idTokenSigningAlgs", "requireIdTokenTypAndAtHash", "acrValues", "clockToleranceSec", "maxIdTokenAgeSec", "sessionMaxEntries", "sessionTtlSec", "pep"] {
         if let Some(value) = raw.get(key).filter(|v| !v.is_null()) {
             out.insert(key.into(), value.clone());
         }

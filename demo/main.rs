@@ -233,13 +233,40 @@ fn live_status(app: &Arc<App>, request: Request) {
         if who.is_empty() { None } else { Some(who) }
     });
     let events = app.events.lock().unwrap().iter().map(|event| json!({"type": event.event_type, "jti": event.jti})).collect::<Vec<_>>();
-    let body = json!({
+    #[allow(unused_mut)]
+    let mut body = json!({
         "signedIn": session.is_some(),
         "subject": subject,
         "receiver": app.state.lock().unwrap().clone(),
         "events": events,
     });
+    #[cfg(feature = "pep")]
+    if let Some(pep) = app.rp.lock().unwrap().as_ref().and_then(|rp| rp.pep().cloned()) {
+        body["pep"] = pep_status(&pep);
+    }
     respond(request, 200, "application/json", &body.to_string(), &[]);
+}
+
+/// The embedded PEP's state for `/live-status`. `Status` holds no secret:
+/// the sync tokens are the versions of what the PEP holds, not credentials.
+#[cfg(feature = "pep")]
+fn pep_status(pep: &oidc_caep_risc::pep::Pep) -> Value {
+    let status = pep.status();
+    json!({
+        "name": status.name,
+        "mode": status.mode.as_str(),
+        "application": status.application,
+        "registered": status.registered,
+        "running": status.running,
+        "holdsPolicy": status.holds_policy,
+        "policyCount": status.policy_count,
+        "syncToken": status.sync_token,
+        "decisions": status.decisions,
+        "allowed": status.allowed,
+        "refused": status.refused,
+        "unavailable": status.unavailable,
+        "lastError": status.last_error,
+    })
 }
 
 fn login(app: &Arc<App>, request: Request) {

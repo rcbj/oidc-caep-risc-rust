@@ -61,7 +61,13 @@ Console: **Protocols → XACML → Remote PEPs**, **Certify the key**, then the 
 
 ### 4. Declare the claims your policy reads
 
-The PEP sends a subject's claims only through the realm's AuthZEN attribute catalogue: a claim with no catalogue row is not sent (iya-sts would refuse the whole request). Add one row per claim your policy uses, on **Protocols → XACML → AuthZEN** or through `/admin-api/xacml/authzen`. For example, to make `acr` available as `urn:example:acr`:
+The PEP sends a subject's claims only through the realm's AuthZEN attribute catalogue: a claim with no catalogue row is not sent (iya-sts would refuse the whole request). Add one row per claim your policy uses, on **Protocols → XACML → AuthZEN** or with `POST /admin-api/xacml/authzen/set-attribute`. For example, to make `acr` available as `urn:example:acr`:
+
+```bash
+api xacml/authzen/set-attribute '{"object":"subject","property":"acr","attributeId":"urn:example:acr"}'
+```
+
+which is the row
 
 | `object` | `property` | `attributeId` |
 |---|---|---|
@@ -71,7 +77,34 @@ The same applies to `resource.properties`, `action.properties` and `context` mem
 
 ### 5. Write the policy
 
-The policy that decides is the application's own fine-grained authorization policy when the application enforces fine-grained authorization, and otherwise the realm's root policy. A `local` PEP is sent that policy and everything it references, and nothing else. The subject's id arrives as XACML's `subject-id`, the action's name as `action-id` and the resource's id as `resource-id`; anything else comes through the catalogue rows of step 4, or from iya-sts's PIP for attributes on the person's directory entry.
+The policy that decides is the application's own fine-grained authorization policy when the application enforces fine-grained authorization, and otherwise the realm's root policy. A `local` PEP is sent that policy and everything it references, and nothing else. The subject's id arrives as XACML's `subject-id`, the action's name as `action-id` and the resource's id as `resource-id`; anything else comes through the catalogue rows of step 4, or from iya-sts's PIP for attributes on the person's directory entry. The resource's type arrives as `urn:sts:xacml:authzen:resource-type`.
+
+For an application that enforces no fine-grained authorization, a root that permits `read` on an `order` when the person's `acr` arrived, and denies everything else, can be written in ALFA (the console's **Policies** tab does the same):
+
+```bash
+api xacml/import-alfa "$(jq -n --arg alfa '
+namespace orders {
+    attribute act { category = actionCat
+        id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }
+    attribute rtype { category = resourceCat
+        id = "urn:sts:xacml:authzen:resource-type" type = string }
+    attribute acr { category = subjectCat id = "urn:example:acr" type = string }
+    policy ordersRoot {
+        id = "urn:example:orders"
+        apply firstApplicable
+        rule readOrder {
+            permit
+            target clause act == "read"
+            target clause rtype == "order"
+            condition integerGreaterThan(stringBagSize(acr), 0)
+        }
+        rule otherwise { deny }
+    }
+}' '{name: "orders", alfa: $alfa}')"
+api xacml/set-root '{"name":"orders"}'
+```
+
+Every change to that policy, or to which policy is the root, is sent to a `local` PEP as `pep-policies-changed` (step 6).
 
 ### 6. (`local` with signals) let the event through
 
@@ -172,7 +205,7 @@ let receiver = SignalsReceiver::new(&transmitter_url, on_end, ReceiverOptions {
 receiver.start()?;
 ```
 
-The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`, verifies each SET like every other one, and hands the event to the PEP. The event is only a hint: the PEP pulls with its own credential and never trusts the event's contents. An event naming another PEP is ignored.
+The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`, verifies each SET like every other one, and hands the event to the PEP. A stream that already exists (made before the `pep` section was added, or while the PEP was `central`) is updated with `PATCH` to ask for the event too; if the transmitter refuses, the receiver still starts, the refusal goes to `on_error`, and the PEP's heartbeat reports the event as `excluded`. The event is only a hint: the PEP pulls with its own credential and never trusts the event's contents. An event naming another PEP is ignored.
 
 ## Operate it
 
@@ -191,7 +224,7 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 | A registration refused with 400 (`STS-XACML-0340`) | The iya-sts release doesn't support this PEP's protocol version. Upgrade iya-sts or this library. |
 | `Deny` saying the evaluation was refused (`local`: "refused (STS-AUTHZEN-0004)"; `central`: "the service refused the evaluation: invalid_request …") | A resource, action or context property you sent has no catalogue row (step 4). Subject claims without a row are dropped, not refused. |
 | `Deny` although the policy should permit | The policy reads a claim that has no catalogue row, so it never arrives (step 4). Or a Permit carried an obligation type missing from `supportedObligations`. |
-| Policy changes take minutes to apply (`local`) | The stream doesn't carry the event: check the console's *policy-change events* column, and `ssfAllowedEvents` (step 6). |
+| Policy changes take minutes to apply (`local`) | The stream doesn't carry the event: check the console's *policy-change events* column, `ssfAllowedEvents` (step 6), and `on_error` for a refused stream update. |
 | The configuration is refused for the assertion key | It is one of this library's own keys. The PEP needs a key of its own. |
 
 ## The demo

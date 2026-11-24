@@ -768,6 +768,11 @@ pub(crate) struct Transmitter {
     /// When set, a DPoP request without this nonce is answered 401 use_dpop_nonce.
     pub(crate) nonce: Mutex<Option<String>>,
     pub(crate) nonce_refusals: Mutex<i32>,
+    /// A poll stream that already exists: GET lists it, PATCH merges into it.
+    pub(crate) existing: Mutex<Option<Value>>,
+    /// Every PATCH body, and whether PATCH is refused (405).
+    pub(crate) patches: Mutex<Vec<Value>>,
+    pub(crate) refuse_patch: Mutex<bool>,
 }
 
 /// A DPoP proof read and verified the way a server would (RFC 9449 section 4.3).
@@ -830,6 +835,9 @@ pub(crate) fn start_transmitter() -> &'static Transmitter {
         proofs: Mutex::new(Vec::new()),
         nonce: Mutex::new(None),
         nonce_refusals: Mutex::new(0),
+        existing: Mutex::new(None),
+        patches: Mutex::new(Vec::new()),
+        refuse_patch: Mutex::new(false),
     }));
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -885,7 +893,26 @@ fn handle_tx(tx: &Transmitter, req: &Req) -> (u16, Vec<(String, String)>, Vec<u8
         return json_res(200, json!({"keys": [ssf_keys().jwk]}));
     }
     if req.path == "/ssf/stream" && req.method == "GET" {
-        return json_res(200, json!([]));
+        return json_res(200, json!(tx.existing.lock().unwrap().iter().cloned().collect::<Vec<_>>()));
+    }
+    if req.path == "/ssf/stream" && req.method == "PATCH" {
+        let doc: Value = serde_json::from_str(&req.body).unwrap_or(json!({}));
+        tx.patches.lock().unwrap().push(doc.clone());
+        if *tx.refuse_patch.lock().unwrap() {
+            return json_res(405, json!({"error": "method_not_allowed"}));
+        }
+        let mut existing = tx.existing.lock().unwrap();
+        let Some(stream) = existing.as_mut().filter(|s| s["stream_id"] == doc["stream_id"]) else {
+            return json_res(404, json!({"error": "not_found"}));
+        };
+        if let Some(events) = doc.get("events_requested") {
+            stream["events_requested"] = events.clone();
+            stream["events_delivered"] = events.clone();
+        }
+        // An answer without delivery: the receiver keeps the one it listed.
+        let mut answer = stream.clone();
+        answer.as_object_mut().unwrap().remove("delivery");
+        return json_res(200, answer);
     }
     if req.path == "/ssf/stream" && req.method == "POST" {
         let doc: Value = serde_json::from_str(&req.body).unwrap_or(json!({}));
