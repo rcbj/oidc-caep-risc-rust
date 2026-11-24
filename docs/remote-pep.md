@@ -30,6 +30,8 @@ api() { curl -s -H "Authorization: Bearer $TOKEN" \
 
 Register the OpenID Connect client in iya-sts as usual; `scripts/configure_iya_sts.py` does it for the demo. Note its identifier: it is the `application` the PEP is bound to (`clientId` by default).
 
+For the demo, `python3 scripts/configure_iya_sts.py --pep local` (or `central`) does steps 1 to 6 in one run and writes the `pep` section: see *The demo*. The steps below are what it does, for your own application.
+
 ### 2. Create the PEP's service account
 
 The PEP signs in as a service account of its own, never as a person or as the application:
@@ -230,6 +232,22 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 ## The demo
 
 Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/oidc.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
+
+Set it up in one command:
+
+```bash
+python3 scripts/configure_iya_sts.py --pep local    # or --pep central
+docker compose up --build
+```
+
+This registers the client as without `--pep`, then does steps 2 to 6:
+- the service account `pep-oidc-demo` (`--pep-name`) in `remote-peps`;
+- a P-256 key in `demo/generated/pep-key.pem`, made with `openssl` (0600, never printed, mounted by Compose and never in the image), certified from its own request with the PEP bound to the demo's application;
+- the catalogue row `subject.acr` → `urn:example:acr`;
+- the demo application's own policy (step 5's, for an application that enforces fine-grained authorization), which it then enforces, so the realm's root is untouched;
+- `pep-policies-changed` added to `ssfAllowedEvents` only if the application restricts it.
+
+It writes the `pep` section (`name`, `mode`, `assertionKey`) into `demo/oidc.json`. Running it again keeps the account, the key and the policy (the policy is written only while the application enforces none, so edits survive), sets the binding again and switches the mode. `--dry-run` prints every call.
 
 Its signed-in page has a **Policy enforcement** tab (`/?tab=pep`) showing what the PEP reports, refreshed every two seconds:
 
