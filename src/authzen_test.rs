@@ -234,7 +234,14 @@ fn answer(pdp: &Pdp, table: &Value, req: &Req) -> (u16, Vec<(String, String)>, V
         "/xacml/pep/register" => json_res(201, json!({"registered": true})),
         "/xacml/pep/heartbeat" => json_res(200, json!({"acknowledged": true, "current": true})),
         "/admin-api/pep-audit" => json_res(200, json!({"acknowledged": 0})),
-        "/xacml/pep/authzen-catalogue" => json_res(200, json!({"syncToken": "c1", "rows": table["catalogue"], "settings": {"obligationsProfile": true}})),
+        "/xacml/pep/authzen-catalogue" => {
+            // As iya-sts's catalogue pull: the applications that enforce
+            // fine-grained authorization, so the PEP adds the two FGA facts.
+            let fga: Vec<Value> = table["applications"].as_object().map(|apps| {
+                apps.values().filter(|a| a["fga"] == json!(true)).map(|a| a["identifier"].clone()).collect()
+            }).unwrap_or_default();
+            json_res(200, json!({"syncToken": "c1", "rows": table["catalogue"], "fgaApplications": fga, "settings": {"obligationsProfile": true}}))
+        }
         "/xacml/pep/policies" => {
             // pep-az-<app>-local
             let name = req.query.get("pep").cloned().unwrap_or_default();

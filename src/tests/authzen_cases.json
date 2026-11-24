@@ -860,7 +860,6 @@
      "access": {"action": "close", "type": "entry", "id": "e1"},
      "expect": {"decision": "Deny"}},
     {"name": "FGA: the stage fact the service adds at access time", "app": "ledger",
-     "knownLocalDefect": "iya-pep's local mapping does not add the two facts iya-sts adds to an evaluation about an application that enforces fine-grained authorization (urn:sts:xacml:fga:application, urn:sts:xacml:fga:stage = access), so local answers NotApplicable where central answers Permit. The offline run holds local to that defect until iya-pep is fixed; the live run fails on it.",
      "login": {"username": "az-alice", "claims": {}},
      "access": {"action": "reconcile", "type": "entry", "id": "e1"},
      "expect": {"decision": "Permit"}},
