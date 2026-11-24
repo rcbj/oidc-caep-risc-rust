@@ -603,39 +603,9 @@ def wait_for(driver, predicate, what):
 PEP_NAME = "pep-oidc-demo"
 PEP_KEY = "generated/pep-key.pem"  # relative to demo/; .dockerignore keeps it out of the image
 PEP_LOCAL_CONFIG = "oidc.pep-local.json"
-PEP_ROOT = "pep-demo-orders"
-PEP_LOCKED = "pep-demo-orders-locked"
-PEP_EVENT = "urn:iya:sts:secevent:event-type:pep-policies-changed"
-ACR_ATTRIBUTE = "urn:example:acr"
-
-
-def orders_policy(namespace, read_effect):
-    """ALFA for the demo's application: read on an order is `read_effect`, and
-    anything else is denied. `read_effect` permit also needs the subject's acr,
-    which only the catalogue row brings, so a Permit shows the claim arrived."""
-    condition = "            condition integerGreaterThan(stringBagSize(acr), 0)\n" if read_effect == "permit" else ""
-    return (
-        f"namespace {namespace} {{\n"
-        '    attribute act { category = actionCat\n'
-        '        id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }\n'
-        '    attribute rtype { category = resourceCat\n'
-        '        id = "urn:sts:xacml:authzen:resource-type" type = string }\n'
-        f'    attribute acr {{ category = subjectCat id = "{ACR_ATTRIBUTE}" type = string }}\n'
-        f"    policy {namespace}Orders {{\n"
-        f'        id = "urn:example:{namespace}-orders"\n'
-        "        apply firstApplicable\n"
-        "        rule readOrder {\n"
-        f"            {read_effect}\n"
-        '            target clause act == "read"\n'
-        '            target clause rtype == "order"\n'
-        f"{condition}"
-        "        }\n"
-        "        rule otherwise {\n"
-        "            deny\n"
-        "        }\n"
-        "    }\n"
-        "}\n"
-    )
+# The PEP's names, its policy and its key path are the install script's:
+# --pep central is what sets the PEP up here, exactly as a user would.
+from configure_iya_sts import ACR_ATTRIBUTE, PEP_EVENT, orders_policy  # noqa: E402,F401
 
 
 def admin_ok(client, sts_origin, token, path, body, what):
@@ -646,70 +616,26 @@ def admin_ok(client, sts_origin, token, path, body, what):
     return parsed
 
 
-def make_pep_key(key_file, work):
-    """A P-256 key made here, 0600, and its certificate request. Neither the
-    key nor its path is printed; only the request leaves this machine."""
-    key_file.parent.mkdir(parents=True, exist_ok=True)
-    old = os.umask(0o077)
-    try:
-        made = subprocess.run(
-            ["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", str(key_file)],
-            check=False, capture_output=True, text=True,
-        )
-    finally:
-        os.umask(old)
-    if made.returncode != 0:
-        raise RuntimeError("openssl could not make the PEP's key")
-    os.chmod(key_file, 0o600)
-    csr = work / "pep-key.csr"
-    asked = subprocess.run(
-        ["openssl", "req", "-new", "-key", str(key_file), "-subj", f"/CN={PEP_NAME}", "-out", str(csr)],
-        check=False, capture_output=True, text=True,
-    )
-    if asked.returncode != 0:
-        raise RuntimeError("openssl could not make the PEP's certificate request")
-    print("generated the PEP's P-256 key (0600, in demo/generated) and its certificate request", flush=True)
-    return csr.read_text(encoding="utf-8")
-
-
-def provision_pep(client, sts_origin, token, application, key_file, work):
-    """docs/remote-pep.md's steps 2 to 5, through /admin-api."""
-    admin_ok(client, sts_origin, token, "/admin-api/users/create", {
-        "username": PEP_NAME, "invent": False, "credential": "none", "serviceAccount": True,
-        "owners": ["admin-write"], "attributes": {"cn": PEP_NAME, "displayName": PEP_NAME},
-    }, f"step 2: the service account {PEP_NAME}")
-    admin_ok(client, sts_origin, token, "/admin-api/groups/add-member",
-             {"group": "remote-peps", "member": PEP_NAME}, "step 2: in remote-peps")
-    csr = make_pep_key(key_file, work)
-    issued = admin_ok(client, sts_origin, token, "/admin-api/xacml/issue-pep-credential",
-                      {"name": PEP_NAME, "csr": csr, "application": application},
-                      f"step 3: issue-pep-credential, bound to {application}")
-    admin_ok(client, sts_origin, token, "/admin-api/xacml/authzen/set-attribute",
-             {"object": "subject", "property": "acr", "attributeId": ACR_ATTRIBUTE},
-             "step 4: the catalogue row subject.acr")
+def flip_policy(client, sts_origin, token, application):
+    """The application's own policy (the install script's) now denies read too."""
+    status, page = admin_json(client, sts_origin, token, "GET",
+                              "/admin-api/applications?application=" + urllib.parse.quote(application, safe=""))
+    fga = ((page.get("page") or {}).get("fga") or {}) if status == 200 else {}
+    name = (fga.get("policy") or {}).get("name") or fga.get("reference")
+    if not name:
+        raise RuntimeError(f"{application}'s page names no policy of its own: {json.dumps(fga)[:400]}")
     admin_ok(client, sts_origin, token, "/admin-api/xacml/import-alfa",
-             {"name": PEP_ROOT, "alfa": orders_policy("pepdemo", "permit")},
-             "step 5: the policy permitting read on order")
-    admin_ok(client, sts_origin, token, "/admin-api/xacml/set-root", {"name": PEP_ROOT},
-             "step 5: made it the realm root")
-    return issued.get("application") or application
+             {"name": name, "alfa": orders_policy("pepdemolocked", "deny")},
+             f"{name} now denies read on order")
 
 
-def flip_policy(client, sts_origin, token):
-    """The realm root moves to a policy that denies read too."""
-    admin_ok(client, sts_origin, token, "/admin-api/xacml/import-alfa",
-             {"name": PEP_LOCKED, "alfa": orders_policy("pepdemolocked", "deny")},
-             "the policy denying read on order")
-    admin_ok(client, sts_origin, token, "/admin-api/xacml/set-root", {"name": PEP_LOCKED},
-             "made it the realm root")
-
-
-def add_pep_sections(config, mode_files):
-    """demo/oidc.json gets a central pep section, and a copy a local one."""
+def local_copy(config, dest):
+    """The install script wrote a central pep section; a copy says local."""
     raw = json.loads(config.read_text(encoding="utf-8"))
-    for mode, dest in mode_files.items():
-        raw["pep"] = {"name": PEP_NAME, "mode": mode, "assertionKey": "demo/" + PEP_KEY}
-        dest.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    if not isinstance(raw.get("pep"), dict) or raw["pep"].get("mode") != "central":
+        raise RuntimeError(f"the install script did not write a central pep section: {json.dumps(raw.get('pep'))}")
+    raw["pep"] = dict(raw["pep"], mode="local")
+    dest.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
 
 def order(driver, method):
@@ -752,12 +678,12 @@ def pep_checks(driver, mode):
     return checks
 
 
-def flip_check(driver, client, sts_origin, token):
-    """In local mode: the root moves to deny read, and the PEP hears of it."""
+def flip_check(driver, client, sts_origin, token, application):
+    """In local mode: the application's policy moves to deny read, and the PEP hears of it."""
     before = pep_state(driver)
     events_before = sum(1 for item in driver.status().get("events") or [] if item.get("type") == PEP_EVENT)
     flipped_at = time.time()
-    flip_policy(client, sts_origin, token)
+    flip_policy(client, sts_origin, token, application)
     limit = float(os.environ.get("PEP_FLIP_TIMEOUT") or 30)
     status = None
     while time.time() - flipped_at < limit:
@@ -818,7 +744,7 @@ def prepare_sts(sts_port, secret, name=None):
     return f"https://127.0.0.1:{sts_port}", name
 
 
-def configure_demo(config, sts_origin, demo_origin, username, password, secret):
+def configure_demo(config, sts_origin, demo_origin, username, password, secret, pep=False):
     env = os.environ.copy()
     env["ADMIN_API_CLIENT_SECRET"] = secret
     env["STS_ADMIN_API_CLIENT_SECRET"] = secret
@@ -831,6 +757,7 @@ def configure_demo(config, sts_origin, demo_origin, username, password, secret):
             "--idp", sts_origin,
             "--public-url", demo_origin,
             "--test-user", username,
+            *(["--pep", "central"] if pep else []),
         ],
         cwd=str(ROOT),
         env=env,
@@ -908,21 +835,22 @@ def main():
         tls_ca = json.loads(config.read_text(encoding="utf-8")).get("tlsCa")
         ca_file = config.parent / tls_ca
         # The install script first: it writes the client secret and tlsCa's file.
-        configure_demo(config, sts_origin, demo_origin, username, password, secret)
+        configure_demo(config, sts_origin, demo_origin, username, password, secret, pep=pep)
         if "BEGIN CERTIFICATE" not in (ca_file.read_text(encoding="utf-8") if ca_file.exists() else ""):
             raise RuntimeError(f"the install script did not write tlsCa's file {tls_ca}")
         pep_key = config.parent / PEP_KEY
         pep_result = {}
         if pep:
-            # The PEP is provisioned once the application exists, and before the
-            # image: the pep sections go into the image, the key never does.
-            admin_client = Client(ca_file)
-            token = mint_admin(admin_client, sts_origin, secret)
+            # The install script set the PEP up (--pep central) and wrote its
+            # section; the local run uses a copy that says local. The sections
+            # go into the image, the key never does.
             written = json.loads(config.read_text(encoding="utf-8"))
             client_id = written.get("clientId") or written.get("client_id")
-            pep_result["application"] = provision_pep(admin_client, sts_origin, token, client_id, pep_key, work)
-            pep_result["name"] = PEP_NAME
-            add_pep_sections(config, {"central": config, "local": config.parent / PEP_LOCAL_CONFIG})
+            if not pep_key.exists():
+                raise RuntimeError("the install script did not make the PEP's key")
+            pep_result["application"] = client_id
+            pep_result["name"] = written["pep"]["name"]
+            local_copy(config, config.parent / PEP_LOCAL_CONFIG)
         # THEN the demo image, which carries the chain from build time.
         docker("build", "-t", image, str(context))
         baked = docker("run", "--rm", "--entrypoint", "cat", image, f"/app/demo/{tls_ca}", capture_output=True).stdout
@@ -984,7 +912,7 @@ def main():
                      "a signed-in local-mode demo polling its stream")
             local = pep_checks(local_driver, "local")
             token = mint_admin(client, sts_origin, secret)
-            local["policyChange"] = flip_check(local_driver, client, sts_origin, token)
+            local["policyChange"] = flip_check(local_driver, client, sts_origin, token, client_id)
             pep_result["local"] = local
             result["pep"] = pep_result
         print(json.dumps(result, indent=2))

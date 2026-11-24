@@ -30,6 +30,8 @@ api() { curl -s -H "Authorization: Bearer $TOKEN" \
 
 Register the OpenID Connect client in iya-sts as usual; `scripts/configure_iya_sts.py` does it for the demo. Note its identifier: it is the `application` the PEP is bound to (`clientId` by default).
 
+For the demo, `python3 scripts/configure_iya_sts.py --pep local` (or `central`) does steps 1 to 6 in one run and writes the `pep` section: see *The demo*. The steps below are what it does, for your own application.
+
 ### 2. Create the PEP's service account
 
 The PEP signs in as a service account of its own, never as a person or as the application:
@@ -230,6 +232,22 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 ## The demo
 
 Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/oidc.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
+
+Set it up in one command:
+
+```bash
+python3 scripts/configure_iya_sts.py --pep local    # or --pep central
+docker compose up --build
+```
+
+This registers the client as without `--pep`, then does steps 2 to 6:
+- the service account `pep-oidc-demo` (`--pep-name`) in `remote-peps`;
+- a P-256 key in `demo/generated/pep-key.pem`, made with `openssl` (0600, never printed, mounted by Compose and never in the image), certified from its own request with the PEP bound to the demo's application;
+- the catalogue row `subject.acr` → `urn:example:acr`;
+- the demo application's own policy (step 5's, for an application that enforces fine-grained authorization), which it then enforces, so the realm's root is untouched;
+- `pep-policies-changed` added to `ssfAllowedEvents` only if the application restricts it.
+
+It writes the `pep` section (`name`, `mode`, `assertionKey`) into `demo/oidc.json`. Running it again keeps the account, the key and the policy (the policy is written only while the application enforces none, so edits survive), sets the binding again and switches the mode. `--dry-run` prints every call.
 
 **The AuthZEN tests** hold the two modes to one answer. `src/tests/authzen_cases.json` is a table of catalogue rows, policies and 54 cases (a sign-in's claims, an `Access`, and the answer the host must see). `cargo test` runs every case through a `local` PEP against a stub PDP. `python3 scripts/live_iya_sts.py --authzen` provisions a fresh iya-sts with one `central` and one `local` PEP per application and fails on any case where the two answer differently, or differently from the table. It found two differences for an application that enforces fine-grained authorization: `central` answered `Unavailable` (the service's 500) wherever that application's policy reached a policy it references, and `local` missed the `urn:sts:xacml:fga:stage` fact the service adds. Both are fixed (iya-sts's `decideAccess()` resolves the references a local PEP is sent, and iya-pep adds the two FGA facts), and the live run is 54 of 54. Two more things are held equal by iya-pep: advice reaches a `central` PEP only while the realm's `authzen.returnReasons` is on, and a `local` PEP writes the caller fact (`urn:sts:xacml:authzen:caller`) as its entry's DN, which the registration answers, as the service does.
 
