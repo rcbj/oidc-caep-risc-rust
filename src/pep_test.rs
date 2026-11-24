@@ -143,6 +143,23 @@ fn a_pep_section_builds_a_started_pep_with_the_librarys_defaults() {
     assert!(RelyingParty::create(provider_config(op, json!({}))).unwrap().pep().is_none(), "no section, no PEP");
 }
 
+/// `from_file` (and `resolve_config`, which the demo calls) kept every member
+/// it knew and dropped the rest, `pep` among them, so a configuration file's
+/// PEP never started. Found by the live run against iya-sts.
+#[test]
+fn from_file_keeps_the_pep_section() {
+    let op = start_provider();
+    let pdp = start_pdp();
+    let doc = provider_config(op, json!({"pep": pep_section(pdp, "from-file", json!({"mode": "central"}))}));
+    let path = std::env::temp_dir().join(format!("oidc-pep-from-file-{}.json", std::process::id()));
+    std::fs::write(&path, Value::Object(doc).to_string()).unwrap();
+    let rp = RelyingParty::from_file(&path.to_string_lossy()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let pep = rp.pep().expect("the configuration file's pep section built a PEP");
+    assert_eq!(pep.config().name, "pep-demo");
+    assert!(pdp.count("/xacml/pep/register") >= 1, "and started it");
+}
+
 #[test]
 fn a_bad_section_is_refused_at_create() {
     let op = start_provider();
@@ -269,6 +286,72 @@ fn the_receiver_asks_for_the_policy_event_and_hands_it_to_the_pep() {
     receiver.stop();
     assert!(rp.decide(&login(), &access).is_permit());
     assert_eq!(pdp.count("/access/v1/evaluation"), 2, "the event cleared the cache");
+}
+
+/// The live run: the demo's stream was made while the PEP was `central`
+/// (no event asked for), and the `local` PEP's receiver found and reused it,
+/// so iya-sts never sent it `pep-policies-changed`. A reused stream now gets
+/// the missing type PATCHed in, and the PEP's heartbeat says `excluded` when
+/// the transmitter won't.
+#[test]
+fn a_reused_stream_gets_the_policy_event_added() {
+    let pdp = start_pdp();
+    let tx = start_transmitter();
+    let op = crate::profile_test::start_op(crate::profile_test::dpop_cfg());
+    let caep = "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
+    *tx.existing.lock().unwrap() = Some(json!({
+        "stream_id": "old", "iss": tx.url, "aud": "my-app",
+        "delivery": {"method": "urn:ietf:rfc:8936", "endpoint_url": format!("{}/ssf/poll/old", tx.url)},
+        "events_requested": [caep], "events_delivered": [caep]
+    }));
+    let rp = Arc::new(crate::profile_test::rp_for(op, json!({"pep": pep_section(pdp, "reuse", json!({"permitCacheMs": 30000, "heartbeatIntervalMs": 1000}))})));
+    let receiver = SignalsReceiver::new(&tx.url, Arc::new(|_, _| {}), ReceiverOptions { relying_party: Some(Arc::clone(&rp)), poll_interval_ms: 60_000, ..ReceiverOptions::default() }).unwrap();
+    receiver.start().unwrap();
+    receiver.stop();
+    assert_eq!(*tx.created.lock().unwrap(), 0, "the stream was reused, not made again");
+    let patches = tx.patches.lock().unwrap().clone();
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert_eq!(patches[0]["stream_id"], "old");
+    let asked: Vec<&str> = patches[0]["events_requested"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(asked.contains(&caep), "what it asked for before is kept: {asked:?}");
+    assert!(asked.contains(&POLICIES_CHANGED_EVENT), "the policy event is added: {asked:?}");
+    let stream = receiver.stream().unwrap();
+    assert!(stream["events_delivered"].as_array().unwrap().iter().any(|e| e == POLICIES_CHANGED_EVENT));
+    assert_eq!(stream["delivery"]["endpoint_url"], format!("{}/ssf/poll/old", tx.url), "the delivery the listing gave is kept");
+
+    // Nothing missing: no PATCH.
+    let again = SignalsReceiver::new(&tx.url, Arc::new(|_, _| {}), ReceiverOptions { relying_party: Some(Arc::clone(&rp)), poll_interval_ms: 60_000, ..ReceiverOptions::default() }).unwrap();
+    again.start().unwrap();
+    again.stop();
+    assert_eq!(tx.patches.lock().unwrap().len(), 1, "a stream that already carries the event is left alone");
+
+    // A transmitter that refuses: the receiver still starts, says so, and
+    // the PEP's heartbeat reports the event excluded.
+    let tx = start_transmitter();
+    *tx.refuse_patch.lock().unwrap() = true;
+    *tx.existing.lock().unwrap() = Some(json!({
+        "stream_id": "fixed", "iss": tx.url, "aud": "my-app",
+        "delivery": {"method": "urn:ietf:rfc:8936", "endpoint_url": format!("{}/ssf/poll/fixed", tx.url)},
+        "events_requested": [caep], "events_delivered": [caep]
+    }));
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&errors);
+    let refused = SignalsReceiver::new(&tx.url, Arc::new(|_, _| {}), ReceiverOptions {
+        relying_party: Some(Arc::clone(&rp)),
+        poll_interval_ms: 60_000,
+        on_error: Some(Arc::new(move |line: &str| seen.lock().unwrap().push(line.to_string()))),
+        ..ReceiverOptions::default()
+    }).unwrap();
+    refused.start().unwrap();
+    refused.stop();
+    assert!(errors.lock().unwrap().iter().any(|l| l.contains("answered 405")), "{:?}", errors.lock().unwrap());
+    let before = pdp.count("/xacml/pep/heartbeat");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while pdp.count("/xacml/pep/heartbeat") <= before && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let beats = pdp.bodies("/xacml/pep/heartbeat");
+    assert_eq!(beats.last().unwrap()["policyEvents"], "excluded", "{beats:?}");
 }
 
 #[cfg(feature = "local")]

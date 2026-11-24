@@ -130,7 +130,7 @@ fn route(app: Arc<App>, request: Request) {
         return;
     }
     if (path == "/pep-status" || path == "/pep-status.html") && method == Method::Get {
-        pep_status(&app, request, path.ends_with(".html"));
+        pep_status_page(&app, request, path.ends_with(".html"));
         return;
     }
     if path == "/" && method == Method::Get {
@@ -256,13 +256,40 @@ fn live_status(app: &Arc<App>, request: Request) {
         if who.is_empty() { None } else { Some(who) }
     });
     let events = app.events.lock().unwrap().iter().map(|event| json!({"type": event.event_type, "jti": event.jti})).collect::<Vec<_>>();
-    let body = json!({
+    #[allow(unused_mut)]
+    let mut body = json!({
         "signedIn": session.is_some(),
         "subject": subject,
         "receiver": app.state.lock().unwrap().clone(),
         "events": events,
     });
+    #[cfg(feature = "pep")]
+    if let Some(pep) = app.rp.lock().unwrap().as_ref().and_then(|rp| rp.pep().cloned()) {
+        body["pep"] = pep_status(&pep);
+    }
     respond(request, 200, "application/json", &body.to_string(), &[]);
+}
+
+/// The embedded PEP's state for `/live-status`. `Status` holds no secret:
+/// the sync tokens are the versions of what the PEP holds, not credentials.
+#[cfg(feature = "pep")]
+fn pep_status(pep: &oidc_caep_risc::pep::Pep) -> Value {
+    let status = pep.status();
+    json!({
+        "name": status.name,
+        "mode": status.mode.as_str(),
+        "application": status.application,
+        "registered": status.registered,
+        "running": status.running,
+        "holdsPolicy": status.holds_policy,
+        "policyCount": status.policy_count,
+        "syncToken": status.sync_token,
+        "decisions": status.decisions,
+        "allowed": status.allowed,
+        "refused": status.refused,
+        "unavailable": status.unavailable,
+        "lastError": status.last_error,
+    })
 }
 
 fn login(app: &Arc<App>, request: Request) {
@@ -554,7 +581,7 @@ fn query_param(url: &str, name: &str) -> String {
 /// what the embedded PEP holds and has done. For a signed-in browser only,
 /// like the page that shows it. Nothing in it is secret: counts, times,
 /// tokens that name policy versions, and the PEP key's public thumbprint.
-fn pep_status(app: &Arc<App>, request: Request, html: bool) {
+fn pep_status_page(app: &Arc<App>, request: Request, html: bool) {
     if session_of(app, &request).is_none() {
         respond(request, 401, "text/plain; charset=utf-8", "sign in first", &[]);
         return;

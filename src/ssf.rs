@@ -522,6 +522,14 @@ impl SignalsReceiver {
         }
         self.jwks(true)?;
         let stream = self.ensure_stream()?;
+        // The PEP's heartbeat says whether this stream carries its event.
+        #[cfg(feature = "pep")]
+        if let Some(pep) = self.relying_party.as_ref().and_then(|rp| rp.pep().cloned()).filter(|pep| crate::pep::wants_events(pep)) {
+            let delivered = stream.get("events_delivered").and_then(Value::as_array).map(|list| list.iter().any(|v| v.as_str() == Some(crate::pep::POLICIES_CHANGED_EVENT)));
+            let requested = stream.get("events_requested").and_then(Value::as_array).map(|list| list.iter().any(|v| v.as_str() == Some(crate::pep::POLICIES_CHANGED_EVENT)));
+            let carried = delivered.or(requested).unwrap_or(true);
+            pep.set_event_stream(if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded });
+        }
         let endpoint = stream.get("delivery").and_then(as_map).map(|d| map_str(d, "endpoint_url")).unwrap_or_default();
         if endpoint.is_empty() {
             return Err(OidcError::new("ssf", "the stream has no poll endpoint_url"));
@@ -1064,7 +1072,7 @@ impl SignalsReceiver {
                 if let Some(stream) = item.as_object() {
                     let method = stream.get("delivery").and_then(as_map).map(|d| map_str(d, "method")).unwrap_or_default();
                     if method == POLL_METHOD && !map_str(stream, "stream_id").is_empty() {
-                        return Ok(stream.clone());
+                        return Ok(self.with_requested_events(stream.clone(), &endpoint));
                     }
                 }
             }
@@ -1081,5 +1089,46 @@ impl SignalsReceiver {
             return Err(OidcError::new("ssf", format!("creating a stream at {endpoint} answered {created_status}: {}", clip(&json_compact(&created), 300))));
         }
         Ok(stream)
+    }
+
+    /// A stream found rather than created can predate an event type this
+    /// receiver asks for now: the embedded PEP's `pep-policies-changed`,
+    /// added once the configuration gained a `pep` section (or moved from
+    /// `central` to `local`). Reused as it was, the transmitter never sends
+    /// that type and the PEP hears of a change only on its fallback poll.
+    /// PATCH merges the missing types in (SSF 1.0, updating a stream). A
+    /// transmitter that refuses leaves the stream as it was, and the refusal
+    /// goes to `on_error`; the receiver still starts.
+    fn with_requested_events(&self, stream: JsonMap, endpoint: &str) -> JsonMap {
+        let listed = |name: &str| stream.get(name).and_then(Value::as_array).map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>());
+        let Some(requested) = listed("events_requested").or_else(|| listed("events_delivered")) else {
+            return stream;
+        };
+        let missing: Vec<String> = self.events_requested.iter().filter(|e| !requested.contains(e)).cloned().collect();
+        if missing.is_empty() {
+            return stream;
+        }
+        let mut merged = requested;
+        merged.extend(missing.iter().cloned());
+        let body = serde_json::json!({"stream_id": map_str(&stream, "stream_id"), "events_requested": merged});
+        let line = match self.call("PATCH", endpoint, Some(&body)) {
+            Ok((200, Value::Object(mut updated), _)) if map_str(&updated, "stream_id") == map_str(&stream, "stream_id") => {
+                if !updated.contains_key("delivery") {
+                    if let Some(delivery) = stream.get("delivery") {
+                        updated.insert("delivery".into(), delivery.clone());
+                    }
+                }
+                return updated;
+            }
+            Ok((status, parsed, _)) => format!("ssf: adding {} to stream {} answered {status}: {}", missing.join(", "), map_str(&stream, "stream_id"), clip(&json_compact(&parsed), 300)),
+            Err(err) => format!("ssf: adding {} to stream {} failed: {err}", missing.join(", "), map_str(&stream, "stream_id")),
+        };
+        match &self.on_error {
+            Some(report) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(&line)));
+            }
+            None => eprintln!("{line}"),
+        }
+        stream
     }
 }
