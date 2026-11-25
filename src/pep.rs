@@ -13,7 +13,8 @@
 //!   `private_key_jwt` key and the DPoP key: `RelyingParty::create` refuses
 //!   a configuration where any two have the same JWK thumbprint.
 //! - **The subject.** A `Login` becomes the PEP's subject: the
-//!   `preferred_username` (else `sub`) as the id, which the service's PIP
+//!   username (iya-sts's `username` claim, else `preferred_username`, else
+//!   `sub`) as the id, which the service's PIP
 //!   resolves, and the ID token's claims (and userinfo, when the
 //!   application fetched it) as properties. The PEP sends only the claims
 //!   the realm's AuthZEN catalogue declares. No request header is read.
@@ -79,8 +80,8 @@ pub(crate) fn build(config: &JsonMap, metadata: &JsonMap, key: Option<&PrivateKe
     Ok(Some(Arc::new(pep)))
 }
 
-/// The PEP's subject for a sign-in: `preferred_username` (else `sub`) as
-/// the id, and every ID token claim as a property. The PEP sends only the
+/// The PEP's subject for a sign-in: the username (the `username` claim,
+/// else `preferred_username`, else `sub`) as the id, and every ID token claim as a property. The PEP sends only the
 /// ones the realm's catalogue declares.
 pub fn subject_of(login: &Login) -> Subject {
     subject_with_userinfo(login, &JsonMap::new())
@@ -93,7 +94,10 @@ pub fn subject_with_userinfo(login: &Login, userinfo: &JsonMap) -> Subject {
     for (name, value) in userinfo {
         properties.insert(name.clone(), value.clone());
     }
-    let id = if login.preferred_username.is_empty() { login.subject.clone() } else { login.preferred_username.clone() };
+    // iya-sts's own `username` claim is on every ID token it issues;
+    // `preferred_username` is a `profile` claim, there only when granted.
+    let username = login.claims.get("username").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(str::to_string);
+    let id = username.unwrap_or_else(|| if login.preferred_username.is_empty() { login.subject.clone() } else { login.preferred_username.clone() });
     Subject::user(id, properties)
 }
 

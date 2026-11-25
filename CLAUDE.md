@@ -18,7 +18,7 @@ The embedded PEP (#46, iya-sts#1206 work item 7), behind the `pep` feature (`loc
   - `signals` and `tlsCa` are the library's;
   - it refuses an assertion key that is the `private_key_jwt` or DPoP key (by JWK thumbprint).
 - Without the feature, a `pep` section is refused rather than ignored.
-- `decide` / `decide_session` adapt a `Login` (`preferred_username`, else `sub`; the ID token claims) into the PEP's subject.
+- `decide` / `decide_session` adapt a `Login` (the `username` claim, else `preferred_username`, else `sub`; the ID token claims) into the PEP's subject.
 - `SignalsReceiver::new` adds `pep-policies-changed` to `events_requested` and registers the hand-over when the relying party's PEP wants events (`local`, or `central` with a Permit cache).
 - `src/pep_test.rs` has its own stub PDP, and reuses `profile_test.rs`'s provider for the receiver test.
 - **The dependency is a git dependency on iya-pep-rust's `feature/1`** until that crate's first release. Switch it to the crates.io version then, because crates.io refuses a git dependency at publish.

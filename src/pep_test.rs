@@ -218,6 +218,12 @@ fn a_login_becomes_the_peps_subject() {
     let mut nameless = login();
     nameless.preferred_username.clear();
     assert_eq!(subject_of(&nameless).id, "0b6e-uuid", "sub when there is no username");
+    let mut claimed = login();
+    claimed.preferred_username.clear();
+    claimed.claims.insert("username".into(), json!("alice-u"));
+    assert_eq!(subject_of(&claimed).id, "alice-u", "iya-sts's username claim, with no preferred_username (no profile scope)");
+    claimed.preferred_username = "alice-p".into();
+    assert_eq!(subject_of(&claimed).id, "alice-u", "and it is the username even beside preferred_username");
     let mut info = JsonMap::new();
     info.insert("email".into(), json!("alice@example.com"));
     info.insert("acr".into(), json!("from-userinfo"));
