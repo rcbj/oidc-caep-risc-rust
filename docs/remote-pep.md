@@ -119,7 +119,7 @@ oidc-caep-risc = { version = "…", features = ["pep"] }    # central
 oidc-caep-risc = { version = "…", features = ["local"] }  # local (includes central)
 ```
 
-Without the feature a `pep` section is refused when the configuration is read, rather than silently ignored.
+Without the feature a `pep` section is refused when the configuration is read, rather than silently ignored. A section that names no `mode` is `local`, so a build with `pep` alone must name `"mode": "central"`; otherwise it is refused the same way.
 
 ## Configure
 
