@@ -170,6 +170,8 @@ match rp.decide_session(&session_id, &access) {
     Decision::Unavailable { why } => forbidden(&why),   // 403: fail closed
 }
 // Or with a Login you hold yourself: rp.decide(&login, &access)
+// The PEP chooses the status itself: 200 for a Permit, 403 for anything else.
+let status = rp.decide_session(&session_id, &access).http_status();
 ```
 
 `Access::new(action, resource_type, resource_id)` carries the AuthZEN action and resource. Add `resource_properties`, `action_properties` or `context` members as your policy needs them, each declared in the catalogue (step 4). The PEP always sets `context.application` to the bound application, whatever you put there.

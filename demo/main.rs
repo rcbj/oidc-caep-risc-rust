@@ -168,21 +168,18 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
         return;
     };
     let action = if *method == Method::Get { "read" } else { "write" };
-    match rp.decide(&session.login, &Access::new(action, "order", id)) {
+    let decision = rp.decide(&session.login, &Access::new(action, "order", id));
+    // The PEP chooses the status: 200 for a Permit, 403 for everything else.
+    let status = decision.http_status();
+    let (title, body) = match &decision {
         Decision::Permit { obligations, .. } => {
             let note = if obligations.is_empty() { String::new() } else { format!("<p><small>{} obligation(s) to discharge.</small></p>", obligations.len()) };
-            let body = format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", esc(id));
-            respond(request, 200, "text/html; charset=utf-8", &page("Order", &body), &[]);
+            ("Order", format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", esc(id)))
         }
-        Decision::Deny { why } => {
-            let body = format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", esc(id), esc(&why));
-            respond(request, 403, "text/html; charset=utf-8", &page("Forbidden", &body), &[]);
-        }
-        Decision::Unavailable { why } => {
-            let body = format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why));
-            respond(request, 403, "text/html; charset=utf-8", &page("Forbidden", &body), &[]);
-        }
-    }
+        Decision::Deny { why } => ("Forbidden", format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", esc(id), esc(why))),
+        Decision::Unavailable { why } => ("Forbidden", format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(why))),
+    };
+    respond(request, status, "text/html; charset=utf-8", &page(title, &body), &[]);
 }
 
 fn home(app: &Arc<App>, request: Request) {
