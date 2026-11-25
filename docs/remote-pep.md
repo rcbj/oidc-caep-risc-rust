@@ -219,6 +219,18 @@ The same receiver tells the transmitter whom this application follows: Add Subje
 
 The receiver keeps the PEP's view of the stream current: `requested` (or `excluded`) when it starts and after each poll that succeeds, `down` after a poll that fails and once `stop()` is called. A `local` PEP polls at `pollIntervalMs` while the stream is not `requested`, so a change still arrives while the stream cannot carry it, and the heartbeat reports the state.
 
+## Credentials
+
+The PEP has credentials of its own, separate from the application's (the client secret or `private_key_jwt` key, the DPoP key, the Shared Signals token; see the README's *Credentials*).
+
+### The embedded PEP's credentials
+
+- **The service account** (step 2): an account with no password, a member of `remote-peps`, named by `pep.name`. Tokens are issued to it, never to a person or the application.
+- **The key** (step 3): EC P-256 preferred (RSA 2048 or more accepted), made where the application runs; only its certificate request is sent. `issue-pep-credential` certifies it for the account and binds the PEP to the application. `pep.assertionKey` names its file (a path); keep the file 0600 and out of images.
+- **What it authenticates:** the PEP signs an RFC 7523 assertion (`iss` = `sub` = the account, `aud` the token endpoint, 120 s, a fresh `jti`) and gets a DPoP-bound access token as the remote-PEP client (`pep.clientId`, default `sts-remote-pep`), one per audience: `xacml:pep` (registration, heartbeat, the catalogue and policy pulls, the PIP), `xacml:pep-audit` (the decision records `local` ships), and `authzen:evaluate` (`central`'s evaluations). The same key signs every DPoP proof, so each token is bound to it. No token, key or proof is logged.
+- **Its own key:** `RelyingParty::create` refuses an assertion key that is the `private_key_jwt` key or the DPoP key, by JWK thumbprint. Shared, the holder of one credential would hold the other, iya-sts could not tell the PEP's calls from the application's, and rotating one would break the other.
+- **Rotation:** see *Operate it* (a new key, `issue-pep-credential` with `revokePrevious: true`, then the file replaced; the PEP reads it again).
+
 ## Operate it
 
 - **Health.** `pep().unwrap().status()` reports whether the PEP is registered and running, whether it holds a policy (and which sync token), its decision counters and its current problems. It holds no secret, so it's safe on a health page.
