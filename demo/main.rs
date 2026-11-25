@@ -592,21 +592,18 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
         return;
     };
     let action = if *method == Method::Get { "read" } else { "write" };
-    match rp.decide(&session.login, &Access::new(action, "order", id)) {
+    let decision = rp.decide(&session.login, &Access::new(action, "order", id));
+    // The PEP chooses the status: 200 for a Permit, 403 for everything else.
+    let status = decision.http_status();
+    let (title, body) = match &decision {
         Decision::Permit { obligations, .. } => {
             let note = if obligations.is_empty() { String::new() } else { format!("<p><small>{} obligation(s) to discharge.</small></p>", obligations.len()) };
-            let body = format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", esc(id));
-            respond(request, 200, "text/html; charset=utf-8", &page_for("Order", &body, Some(&session.login)), &[]);
+            ("Order", format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", esc(id)))
         }
-        Decision::Deny { why } => {
-            let body = format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", esc(id), esc(&why));
-            respond(request, 403, "text/html; charset=utf-8", &page_for("Forbidden", &body, Some(&session.login)), &[]);
-        }
-        Decision::Unavailable { why } => {
-            let body = format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why));
-            respond(request, 403, "text/html; charset=utf-8", &page_for("Forbidden", &body, Some(&session.login)), &[]);
-        }
-    }
+        Decision::Deny { why } => ("Forbidden", format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", esc(id), esc(why))),
+        Decision::Unavailable { why } => ("Forbidden", format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(why))),
+    };
+    respond(request, status, "text/html; charset=utf-8", &page_for(title, &body, Some(&session.login)), &[]);
 }
 
 /// `GET /attribute-protected`: decided by the embedded PEP against the demo
@@ -629,10 +626,13 @@ fn attribute_protected(app: &Arc<App>, request: Request) {
         return;
     };
     let what = "<p><small>The demo application's policy permits <code>read</code> on <code>attribute-protected</code> when your directory attribute <code>attr1</code> is <code>abc123</code>. The PEP asked iya-sts's PIP for it: it is not in your ID token.</small></p>";
-    let (status, title, body) = match rp.decide(&session.login, &Access::new("read", "attribute-protected", "attr1")) {
-        Decision::Permit { .. } => (200, "Attribute-protected", format!("<h1>Allowed</h1><p class=\"notice\">The PEP permitted it: your <code>attr1</code> is <code>abc123</code>.</p>{what}")),
-        Decision::Deny { why } => (403, "Forbidden", format!("<h1>Not allowed</h1><p class=\"problem\">The PEP denied it: {}</p>{what}", esc(&why))),
-        Decision::Unavailable { why } => (403, "Forbidden", format!("<h1>No decision</h1><p class=\"problem\">The PEP could not decide: {}</p>{what}", esc(&why))),
+    let decision = rp.decide(&session.login, &Access::new("read", "attribute-protected", "attr1"));
+    // The PEP chooses the status: 200 for a Permit, 403 for everything else.
+    let status = decision.http_status();
+    let (title, body) = match &decision {
+        Decision::Permit { .. } => ("Attribute-protected", format!("<h1>Allowed</h1><p class=\"notice\">The PEP permitted it: your <code>attr1</code> is <code>abc123</code>.</p>{what}")),
+        Decision::Deny { why } => ("Forbidden", format!("<h1>Not allowed</h1><p class=\"problem\">The PEP denied it: {}</p>{what}", esc(why))),
+        Decision::Unavailable { why } => ("Forbidden", format!("<h1>No decision</h1><p class=\"problem\">The PEP could not decide: {}</p>{what}", esc(why))),
     };
     respond(request, status, "text/html; charset=utf-8", &page_for(title, &body, Some(&session.login)), &[]);
 }
