@@ -1169,11 +1169,14 @@ fn pep_fragment(rp: Option<&Arc<RelyingParty>>) -> String {
         out.push_str(&format!("<p class=\"problem\">{}</p>", esc(problems)));
     }
     for (title, rows) in cards {
-        out.push_str(&format!("<section class=\"card\"><h2>{}</h2><table class=\"facts\">", esc(title)));
+        // Collapsible, as the Session tab's panes are; the id is stable so
+        // pep.js can keep a pane the person closed closed across refreshes.
+        let id: String = format!("pep-{}", title.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>());
+        out.push_str(&format!("<details class=\"card pane\" id=\"{id}\" open><summary><h2>{}</h2></summary><table class=\"facts\">", esc(title)));
         for (k, val) in rows {
             out.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", esc(&k), esc(&val)));
         }
-        out.push_str("</table></section>");
+        out.push_str("</table></details>");
     }
     out.push_str("<p><small>Refreshed every 2 seconds. <a href=\"/pep-status\">As JSON</a>.</small></p>");
     out
@@ -1397,13 +1400,17 @@ mod tests {
         rp.decide(&Login::default(), &oidc_caep_risc::pep::Access::new("read", "order", "1"));
         let html = pep_fragment(Some(&rp));
         for title in ["Decisions", "Cached policy", "The PEP", "Control plane"] {
-            assert!(html.contains(&format!("<h2>{title}</h2>")), "{title}");
+            assert!(html.contains(&format!("<summary><h2>{title}</h2></summary>")), "{title} is a collapsible pane");
         }
         assert!(html.contains("<th>Decisions</th><td>1</td>"), "the decision was counted");
         assert!(html.contains("<th>Unavailable (no decision; refused)</th><td>1</td>"));
         assert!(html.contains("class=\"problem\""), "iya-sts is unreachable, and the page says so");
         assert!(html.contains("Permit cache"), "central mode shows the cache");
         assert!(!html.contains("<script"), "the fragment carries no script");
+        for id in ["pep-decisions", "pep-cached-policy", "pep-the-pep", "pep-control-plane"] {
+            assert!(html.contains(&format!("<details class=\"card pane\" id=\"{id}\" open>")), "{id}: open by default, with the id pep.js keeps it closed by");
+        }
+        assert!(!html.contains("<section"), "no pane is left as a plain card");
         let v = pep_json(Some(&rp));
         assert_eq!((v["enabled"].clone(), v["mode"].clone(), v["decisions"]["unavailable"].clone()), (json!(true), json!("central"), json!(1)));
         assert!(v["policy"]["untilNextPullMs"].is_u64() || v["policy"]["untilNextPullMs"].is_null());

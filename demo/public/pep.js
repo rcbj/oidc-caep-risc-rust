@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 // The Policy enforcement tab: fetches the server-drawn fragment again every
 // two seconds, so the counters and the times (last update, next pull) stay
-// current. The server escapes everything in it. A hidden page doesn't poll;
+// current, keeping closed any pane the person closed. The server escapes
+// everything in it. A hidden page doesn't poll;
 // a 401 means the session is gone, so it goes back to the sign-in page.
 const panel = document.getElementById('pep-panel');
 const EVERY_MS = 2000;
@@ -15,7 +16,15 @@ async function refresh() {
       window.location.assign('/');
       return;
     }
-    if (answer.ok) panel.innerHTML = await answer.text();
+    if (answer.ok) {
+      // The panes are collapsible: keep closed the ones the person closed.
+      const closed = new Set([...panel.querySelectorAll('details[id]')].filter((d) => !d.open).map((d) => d.id));
+      panel.innerHTML = await answer.text();
+      for (const id of closed) {
+        const pane = document.getElementById(id);
+        if (pane) pane.open = false;
+      }
+    }
   } catch (err) {
     // The demo restarting: keep what is shown and try again on the next tick.
   }
