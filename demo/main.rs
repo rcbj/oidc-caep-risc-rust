@@ -335,10 +335,14 @@ fn event_item(event: &LiveEvent) -> String {
 fn events_panel(events: &[LiveEvent], stream: &str, notice: &str) -> String {
     let items: String = events.iter().rev().map(event_item).collect();
     let notice = if notice.is_empty() { String::new() } else { format!("<p class=\"notice\">{}</p>", esc(notice)) };
+    // The one stream is the application's, so the log is too: a real
+    // application shows a person only events about their own session or
+    // account, and keeps the rest from them.
+    let scope = "<p class=\"warning\"><strong>Every event this application received, for every user.</strong> This tab lists all the CAEP and RISC events the application's Shared Signals stream delivered: events about other people's sessions and accounts as well as yours. That is for this demonstration only. A real application must take additional safeguards: show a person only the events about their own session or account, and keep the others to the people whose job is to see them.</p>";
     format!(
-        "{notice}<table class=\"facts\"><tr><th>Stream status</th><td id=\"stream-status\">{}</td></tr></table>\
+        "{notice}{scope}<table class=\"facts\"><tr><th>Stream status</th><td id=\"stream-status\">{}</td></tr></table>\
 <form id=\"verify-form\" method=\"post\" action=\"/signals/verify\"><button type=\"submit\">Ask for a verification event</button></form>\
-<p><small>The CAEP and RISC events this application's receiver has accepted, newest first, and the verification events it asked for. Each appears here within moments of the receiver getting it: <span id=\"live-state\">connecting…</span></small></p>\
+<p><small>The CAEP and RISC events this application's receiver has accepted, about anybody, newest first, and the verification events it asked for. Each appears here within moments of the receiver getting it: <span id=\"live-state\">connecting…</span></small></p>\
 <ul class=\"log\" id=\"log\">{items}</ul>\
 <p class=\"empty\" id=\"log-empty\"{}>No CAEP or RISC event yet. At iya-sts, change this person's password (credential-change), sign them out (session-revoked), or disable them (account-disabled), and watch this tab.</p>",
         esc(stream),
@@ -1372,6 +1376,8 @@ mod tests {
         assert!(html.contains("&lt;b&gt;gone&lt;/b&gt;") && !html.contains("<b>gone"), "members escaped");
         assert!(html.contains("polling &lt;s&gt;") && html.contains("j&lt;1&gt;"));
         assert!(html.contains("id=\"log-empty\" hidden"), "the empty note hidden once there are events");
+        assert!(html.contains("class=\"warning\"><strong>Every event this application received, for every user.</strong>"), "the tab says it is every user's events");
+        assert!(html.contains("additional safeguards") && events_panel(&[], "", "").contains("for every user"), "with or without events");
         assert!(events_panel(&[], "", "").contains("id=\"log-empty\">"), "and shown when there are none");
         assert!(!html.contains(">subject<"), "the subject member is the Subject line, not a row");
     }

@@ -96,3 +96,4 @@ button.small { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
 
 /* hidden means hidden, whatever a rule above sets for the element (button is inline-block). */
 [hidden] { display: none !important; }
+.warning { border: 1px solid #b7791f; border-left-width: 4px; border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0 0 1rem; background: rgba(183, 121, 31, 0.08); }
