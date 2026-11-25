@@ -152,7 +152,9 @@ fn route(app: Arc<App>, request: Request) {
 /// A route the embedded PEP protects (the `pep` feature, iya-sts#1206): the
 /// signed-in person's access to one order, decided by the `pep` section's
 /// PEP. A GET is `read` and anything else `write`. No sign-in is 401, a
-/// Deny 403, and a decision that couldn't be made 503: never served.
+/// Deny 403, and any other PEP failure 403 too (no decision, or no relying
+/// party to ask): an enforcement point that cannot say yes says no, and the
+/// page says which. Never served.
 #[cfg(feature = "pep")]
 fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
     use oidc_caep_risc::pep::{Access, Decision};
@@ -162,7 +164,7 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
     };
     let (rp, _) = relying_party(app);
     let Some(rp) = rp else {
-        respond(request, 503, "text/html; charset=utf-8", &page("Unavailable", "<h1>The relying party is not configured</h1>"), &[]);
+        respond(request, 403, "text/html; charset=utf-8", &page("Forbidden", "<h1>Not allowed</h1><p class=\"problem\">No decision could be asked for: the relying party is not configured.</p>"), &[]);
         return;
     };
     let action = if *method == Method::Get { "read" } else { "write" };
@@ -178,7 +180,7 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
         }
         Decision::Unavailable { why } => {
             let body = format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why));
-            respond(request, 503, "text/html; charset=utf-8", &page("Unavailable", &body), &[]);
+            respond(request, 403, "text/html; charset=utf-8", &page("Forbidden", &body), &[]);
         }
     }
 }

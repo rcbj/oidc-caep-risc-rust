@@ -71,7 +71,7 @@ The stub tests do not start iya-sts. `python3 scripts/live_iya_sts.py` does, unl
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. `GET /live-status` reports the sign-in and the Shared Signals events this process has accepted, and (with a `pep` section) the PEP's `status()` under `pep`; its `syncToken` is the version of the policy held, not a credential. It does not include tokens. `GET /orders/<id>` is read and any other method write, decided by the PEP: 401 without a sign-in, 200, 403, or 503 on `Unavailable`.
+`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. `GET /live-status` reports the sign-in and the Shared Signals events this process has accepted, and (with a `pep` section) the PEP's `status()` under `pep`; its `syncToken` is the version of the policy held, not a credential. It does not include tokens. `GET /orders/<id>` is read and any other method write, decided by the PEP: 401 without a sign-in, 200, or 403 on a Deny and on any PEP failure (`Unavailable`, or no relying party): an enforcement point that cannot say yes says no.
 
 A loopback redirect follows `PORT` in the running server and in `scripts/configure_iya_sts.py`. Any other host is left as written. An explicit `--public-url` or a non-empty `PUBLIC_URL` replaces the origin and keeps the path. The running container's `PORT` wins over the shell's when the script registers the application. `pollIntervalMs` is a millisecond pause, not a port.
 
