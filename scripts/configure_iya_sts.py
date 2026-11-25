@@ -509,9 +509,9 @@ def _errors_of(body):
     return [str(item) for item in errors]
 
 
-def _mint_admin_token(base, ca, secret):
+def _mint_admin_token(base, ca, secret, scope="admin:read admin:write"):
     import base64
-    form = f"grant_type=client_credentials&scope={quote('admin:read admin:write')}&resource={quote(base + '/admin-api', safe='')}"
+    form = f"grant_type=client_credentials&scope={quote(scope)}&resource={quote(base + '/admin-api', safe='')}"
     token = base64.b64encode(f"sts-api-client:{secret}".encode()).decode()
     reply = _json_call(f"{base}/oauth2/token", ca, "POST", {
         "content-type": "application/x-www-form-urlencoded",
@@ -554,18 +554,20 @@ def set_test_attribute(api, user):
     """The realm's custom attribute attr1, and the test user's value of it,
     which GET /attribute-protected is decided on.
 
-    Defining a custom attribute changes the realm's attribute policy, which
-    only a Security Administrator may do (a person holding SECURITY_ADMIN,
-    with an admin:security token); the management API client this script
-    uses holds Admin Write, which does not reach it. So a refusal there is
-    not fatal: the rest of the setup goes on, and the script says what a
-    Security Administrator does on the console before this is run again.
+    Defining a custom attribute changes the realm's attribute policy, a
+    Security Administrator's change: it needs a token carrying
+    admin:security whose subject holds SECURITY_ADMIN. iya-sts seeds
+    sts-api-client in that role, so the script defines attr1 itself with a
+    token minted for that call alone. Where an operator has taken the
+    client out of the role, iya-sts issues the token without the scope and
+    refuses the definition; that is not fatal: the rest of the setup goes
+    on, and the script says what a Security Administrator does instead.
     Answers whether the test user now holds the value."""
     try:
         defined = api("/policies/define-person-attribute", {
             "name": TEST_ATTRIBUTE, "label": "Attribute 1", "syntax": "string", "multiValued": False,
             "description": "The demo's attribute-protected resource is permitted when this is abc123.",
-        })
+        }, security=True)
     except RuntimeError as err:
         # _json_call raises on 401 and 403; only the Security Administrator
         # refusal is expected here, and it is not fatal.
@@ -588,7 +590,8 @@ def set_test_attribute(api, user):
         # Only now does the refusal matter: the attribute is not defined,
         # and this credential cannot define it.
         print(f"The custom attribute {TEST_ATTRIBUTE} is not defined, and this credential cannot define it:")
-        print("only a Security Administrator may change the attribute policy. Sign in to the console as one")
+        print("sts-api-client no longer holds SECURITY_ADMIN here (iya-sts seeds it there; an operator took it")
+        print("out). Put it back on Roles, or sign in to the console as a Security Administrator")
         print("(the bootstrap administrator is), open Directory > Policies > Attribute policy > Custom")
         print(f"attributes, and add {TEST_ATTRIBUTE} (label \"Attribute 1\", syntax string, one value). Then run")
         print(f"this script again to give {user} {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}.")
@@ -792,9 +795,20 @@ def main(argv=None):
     if not admin_secret:
         raise RuntimeError("neither ADMIN_API_CLIENT_SECRET nor STS_ADMIN_API_CLIENT_SECRET is set, so no /admin-api token can be minted.")
     token = _mint_admin_token(base, ca, admin_secret)
+    security_token = []
 
-    def api(path, body=None, method="POST"):
-        headers = {"accept": "application/json", "authorization": f"Bearer {token}"}
+    def api(path, body=None, method="POST", security=False):
+        # A change iya-sts counts as security (a Directory > Policies policy,
+        # such as the realm's custom attributes) needs admin:security, held
+        # through SECURITY_ADMIN, which iya-sts seeds sts-api-client in. That
+        # token is minted only when such a call is made, and used for it
+        # alone; every other call carries admin:read and admin:write.
+        bearer = token
+        if security:
+            if not security_token:
+                security_token.append(_mint_admin_token(base, ca, admin_secret, "admin:read admin:security"))
+            bearer = security_token[0]
+        headers = {"accept": "application/json", "authorization": f"Bearer {bearer}"}
         payload = None
         if body is not None:
             headers["content-type"] = "application/json"
