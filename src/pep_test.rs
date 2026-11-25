@@ -423,3 +423,46 @@ fn a_section_without_a_mode_is_local() {
     let rp = RelyingParty::create(provider_config(op, json!({"signals": false, "pep": section}))).unwrap();
     assert_eq!(rp.pep().unwrap().status().mode, crate::pep::Mode::Local);
 }
+
+/// A stream that names subjects carries only events about them (iya-sts
+/// under `default_subjects` ALL), and `pep-policies-changed` is about the
+/// application: a receiver whose PEP wants events names the application at
+/// `start`, as the event's `application` member, and never removes it.
+/// Found live by wsfed-caep-rust: after the first sign-in the policy flip
+/// came by poll, not by event.
+#[cfg(feature = "local")]
+#[test]
+fn a_receiver_adding_subjects_names_the_application_its_pep_hears_about() {
+    let pdp = start_pdp();
+    let tx = start_transmitter();
+    *tx.subject_endpoints.lock().unwrap() = true;
+    let op = crate::profile_test::start_op(crate::profile_test::dpop_cfg());
+    let local = Arc::new(crate::profile_test::rp_for(op, json!({"pep": pep_section(pdp, "subjects", json!({"mode": "local"}))})));
+    let receiver = SignalsReceiver::new(&tx.url, Arc::new(|_, _| {}), ReceiverOptions { relying_party: Some(Arc::clone(&local)), poll_interval_ms: 60_000, ..ReceiverOptions::default() }).unwrap();
+    receiver.start().unwrap();
+    let application = json!({"format": "opaque", "id": "oidc-caep-risc-demo"});
+    let calls = tx.subject_calls.lock().unwrap().clone();
+    assert_eq!(calls, vec![("add".to_string(), json!({"stream_id": "s1", "subject": application, "verified": true}))]);
+    let mut session = crate::value::JsonMap::new();
+    session.insert("local_id".into(), json!("L1"));
+    session.insert("person".into(), json!("alice"));
+    receiver.track(session);
+    receiver.untrack("L1");
+    let calls = tx.subject_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 3, "the person added and removed: {calls:?}");
+    assert!(!calls.iter().any(|(kind, body)| kind == "remove" && body["subject"] == application), "the application is never removed");
+    receiver.stop();
+
+    // Switched off, or a PEP that wants no events (central, no Permit
+    // cache): the application is not named.
+    let tx = start_transmitter();
+    *tx.subject_endpoints.lock().unwrap() = true;
+    let off = SignalsReceiver::new(&tx.url, Arc::new(|_, _| {}), ReceiverOptions { relying_party: Some(Arc::clone(&local)), poll_interval_ms: 60_000, add_subjects: false, ..ReceiverOptions::default() }).unwrap();
+    off.start().unwrap();
+    off.stop();
+    let central = Arc::new(crate::profile_test::rp_for(op, json!({"pep": pep_section(pdp, "subjects-central", json!({}))})));
+    let quiet = SignalsReceiver::new(&tx.url, Arc::new(|_, _| {}), ReceiverOptions { relying_party: Some(central), poll_interval_ms: 60_000, ..ReceiverOptions::default() }).unwrap();
+    quiet.start().unwrap();
+    quiet.stop();
+    assert!(tx.subject_calls.lock().unwrap().is_empty(), "{:?}", tx.subject_calls.lock().unwrap());
+}
