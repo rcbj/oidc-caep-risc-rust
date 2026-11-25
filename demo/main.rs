@@ -463,6 +463,11 @@ fn route(app: Arc<App>, request: Request) {
         respond(request, 200, "text/javascript; charset=utf-8", raw, &[]);
         return;
     }
+    if path == "/menu.js" && method == Method::Get {
+        let raw = include_str!("public/menu.js");
+        respond(request, 200, "text/javascript; charset=utf-8", raw, &[]);
+        return;
+    }
     if path == "/pep.js" && method == Method::Get {
         let raw = include_str!("public/pep.js");
         respond(request, 200, "text/javascript; charset=utf-8", raw, &[]);
@@ -540,15 +545,15 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
         Decision::Permit { obligations, .. } => {
             let note = if obligations.is_empty() { String::new() } else { format!("<p><small>{} obligation(s) to discharge.</small></p>", obligations.len()) };
             let body = format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", esc(id));
-            respond(request, 200, "text/html; charset=utf-8", &page("Order", &body), &[]);
+            respond(request, 200, "text/html; charset=utf-8", &page_for("Order", &body, Some(&session.login)), &[]);
         }
         Decision::Deny { why } => {
             let body = format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", esc(id), esc(&why));
-            respond(request, 403, "text/html; charset=utf-8", &page("Forbidden", &body), &[]);
+            respond(request, 403, "text/html; charset=utf-8", &page_for("Forbidden", &body, Some(&session.login)), &[]);
         }
         Decision::Unavailable { why } => {
             let body = format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why));
-            respond(request, 503, "text/html; charset=utf-8", &page("Unavailable", &body), &[]);
+            respond(request, 503, "text/html; charset=utf-8", &page_for("Unavailable", &body, Some(&session.login)), &[]);
         }
     }
 }
@@ -558,7 +563,7 @@ fn home(app: &Arc<App>, request: Request) {
     let (rp, err) = relying_party(app);
     if let Some(session) = session {
         let login = &session.login;
-        let who = if !login.preferred_username.is_empty() { login.preferred_username.clone() } else if !login.email.is_empty() { login.email.clone() } else { login.subject.clone() };
+        let who = display_name(login);
         let sid = cookie_value(&request, "oidc_session");
         let notice = match query_param(request.url(), "done").as_str() {
             "refreshed" => "The tokens were refreshed.",
@@ -603,14 +608,14 @@ fn home(app: &Arc<App>, request: Request) {
         };
         let count = if events.is_empty() { String::new() } else { events.len().to_string() };
         let body = format!(
-            "<h1>Signed in as {}</h1><nav class=\"page-tabs\" role=\"tablist\" aria-label=\"Sections\">{}{}{}</nav><p id=\"signal-banner\" class=\"problem\" hidden></p><p id=\"signal-toast\" class=\"notice\" hidden></p><div role=\"tabpanel\" id=\"panel\" data-base=\"\" data-tab=\"{}\" data-last-id=\"{last_id}\">{content}</div><form method=\"post\" action=\"/logout\"><button type=\"submit\">Sign out</button></form><script src=\"/app.js\" defer></script>",
+            "<h1>Signed in as {}</h1><nav class=\"page-tabs\" role=\"tablist\" aria-label=\"Sections\">{}{}{}</nav><p id=\"signal-banner\" class=\"problem\" hidden></p><p id=\"signal-toast\" class=\"notice\" hidden></p><div role=\"tabpanel\" id=\"panel\" data-base=\"\" data-tab=\"{}\" data-last-id=\"{last_id}\">{content}</div><script src=\"/app.js\" defer></script>",
             esc(&who),
             tab_link("session", "/", "Session"),
             tab_link("events", "/?tab=events", &format!("CAEP &amp; RISC events <span class=\"count\" id=\"signal-count\">{count}</span>")),
             tab_link("pep", "/?tab=pep", "Policy enforcement"),
             esc(&tab)
         );
-        respond(request, 200, "text/html; charset=utf-8", &page("Signed in", &body), &[]);
+        respond(request, 200, "text/html; charset=utf-8", &page_for("Signed in", &body, Some(login)), &[]);
         return;
     }
     let mut issuer = String::new();
@@ -627,14 +632,7 @@ fn home(app: &Arc<App>, request: Request) {
 fn live_status(app: &Arc<App>, request: Request) {
     let session = session_of(app, &request);
     let subject = session.as_ref().and_then(|session| {
-        let login = &session.login;
-        let who = if !login.preferred_username.is_empty() {
-            login.preferred_username.clone()
-        } else if !login.email.is_empty() {
-            login.email.clone()
-        } else {
-            login.subject.clone()
-        };
+        let who = display_name(&session.login);
         if who.is_empty() { None } else { Some(who) }
     });
     let events = app.events.lock().unwrap().iter().map(|event| json!({"type": event.event_type, "jti": event.jti})).collect::<Vec<_>>();
@@ -681,7 +679,14 @@ fn login(app: &Arc<App>, request: Request) {
         respond(request, 500, "text/html; charset=utf-8", &page("Error", &format!("<h1>Something went wrong</h1><p class=\"problem\">{}</p>", esc(&err.unwrap_or_default()))), &[]);
         return;
     };
-    match rp.authorize() {
+    // Only the two prompts the menu and the page ask for; anything else is
+    // the ordinary sign-in.
+    let prompt = match query_param(request.url(), "prompt").as_str() {
+        p @ ("login" | "select_account") => p.to_string(),
+        _ => String::new(),
+    };
+    let asked = if prompt.is_empty() { rp.authorize() } else { rp.authorize_options(oidc_caep_risc::AuthorizeOptions { prompt, ..Default::default() }) };
+    match asked {
         Ok(txn) => {
             let sealed = seal(app, &json!({"state": txn.state, "nonce": txn.nonce, "code_verifier": txn.code_verifier, "redirect_uri": txn.redirect_uri, "acr_values": txn.acr_values}).to_string());
             redirect(request, 302, &txn.url, &[cookie(app, "oidc_txn", &sealed, "/callback", 600)]);
@@ -1009,7 +1014,51 @@ fn redirect(request: Request, status: u16, location: &str, cookies: &[String]) {
 }
 
 fn page(title: &str, body: &str) -> String {
-    format!("<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title><link rel=\"stylesheet\" href=\"/styles.css\"></head>\n<body><header><a href=\"/\">oidc-caep-risc demo</a></header><main>\n{body}\n</main><footer>A traditional web application signing in with OpenID Connect through oidc-caep-risc.</footer></body>\n</html>\n", esc(title))
+    page_for(title, body, None)
+}
+
+/// A page, with the user menu in the top bar when someone is signed in.
+fn page_for(title: &str, body: &str, who: Option<&Login>) -> String {
+    let menu = who.map(user_menu).unwrap_or_default();
+    let script = if who.is_some() { "<script src=\"/menu.js\" defer></script>" } else { "" };
+    format!("<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title><link rel=\"stylesheet\" href=\"/styles.css\"></head>\n<body><header class=\"topbar\"><a href=\"/\">oidc-caep-risc demo</a>{menu}</header><main>\n{body}\n</main><footer>A traditional web application signing in with OpenID Connect through oidc-caep-risc.</footer>{script}</body>\n</html>\n", esc(title))
+}
+
+/// The sign-in's username: iya-sts's own `username` claim, which every ID
+/// token it issues carries, else `preferred_username` (a `profile` claim,
+/// issued only when that scope was granted). Empty when neither is there.
+fn username_of(login: &Login) -> String {
+    login.claims.get("username").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(str::to_string).unwrap_or_else(|| login.preferred_username.clone())
+}
+
+/// Who a sign-in is, as the heading, the menu and /live-status name them:
+/// the username, and the subject only when there is no username and no
+/// email.
+fn display_name(login: &Login) -> String {
+    [username_of(login), login.email.clone(), login.subject.clone()].into_iter().find(|v| !v.is_empty()).unwrap_or_default()
+}
+
+/// The top bar's user menu, as the browser library's demo has it: the
+/// signed-in account, signing in with another account, and signing out.
+/// This demo keeps one sign-in per browser, so another account replaces
+/// this one rather than being switched to.
+fn user_menu(login: &Login) -> String {
+    let name = display_name(login);
+    let initial = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
+    let detail = [login.name.clone(), login.email.clone()].into_iter().find(|v| !v.is_empty() && *v != name).unwrap_or_default();
+    let detail = if detail.is_empty() { String::new() } else { format!("<span class=\"muted small\">{}</span>", esc(&detail)) };
+    format!(
+        "<details class=\"acct-menu\"><summary aria-label=\"Account menu\"><span class=\"avatar\" aria-hidden=\"true\">{i}</span><span class=\"menu-name\" title=\"{n}\">{n}</span><span class=\"caret\" aria-hidden=\"true\">▾</span></summary>\
+<div class=\"menu\" role=\"menu\"><p class=\"menu-head\">Signed in</p>\
+<div class=\"menu-row static\"><span class=\"avatar\" aria-hidden=\"true\">{i}</span><span class=\"menu-who\"><span>{n}</span>{detail}</span></div>\
+<div class=\"menu-sep\"></div>\
+<a class=\"menu-row\" role=\"menuitem\" href=\"/login?prompt=login\"><span class=\"avatar plus\" aria-hidden=\"true\">+</span>Sign in with another account</a>\
+<p class=\"muted small menu-note\">The identity provider asks who you are, even if it already knows. This demo keeps one sign-in per browser: the new account replaces this one.</p>\
+<div class=\"menu-sep\"></div>\
+<form method=\"post\" action=\"/logout\"><button class=\"menu-row\" type=\"submit\" role=\"menuitem\">Sign out {n}</button></form></div></details>",
+        i = esc(&initial),
+        n = esc(&name)
+    )
 }
 
 /// One query parameter of a request URL, decoded, or empty.
@@ -1358,6 +1407,38 @@ mod tests {
         assert!(table.find(">amr<").unwrap() < table.find(">auth_time<").unwrap(), "sorted by name");
         assert_eq!(in_words(90.0), "1m 30s");
         assert_eq!(in_words(-3700.0), "1h 1m ago");
+    }
+
+    #[test]
+    fn the_user_menu_names_the_account_and_holds_sign_out() {
+        let mut login = Login { subject: "urn:uuid:1".into(), name: "<Alice> Admin".into(), email: "alice@example.com".into(), ..Default::default() };
+        let menu = user_menu(&login);
+        assert!(menu.contains("<span class=\"avatar\" aria-hidden=\"true\">A</span>"), "{menu}");
+        assert!(menu.contains("&lt;Alice&gt; Admin") && !menu.contains("<Alice>"), "the name, escaped");
+        assert!(menu.contains("alice@example.com"), "no username: the email names them");
+        assert!(menu.contains("href=\"/login?prompt=login\""), "another account always asks");
+        assert!(menu.contains("<form method=\"post\" action=\"/logout\"><button class=\"menu-row\""), "sign out is a POST, in the menu");
+        login.name.clear();
+        login.email.clear();
+        assert!(user_menu(&login).contains("urn:uuid:1"), "falls back to the subject");
+        let page = page_for("x", "<p>body</p>", Some(&Login { name: "Bob".into(), ..Default::default() }));
+        assert!(page.contains("acct-menu") && page.contains("/menu.js"));
+        assert!(!page_for("x", "", None).contains("acct-menu"), "no menu when nobody is signed in");
+    }
+
+    #[test]
+    fn the_name_shown_is_the_username_claim_never_the_subject_when_there_is_one() {
+        let mut claims = serde_json::Map::new();
+        claims.insert("username".into(), json!("alice"));
+        let login = Login { subject: "urn:uuid:3e0f".into(), claims, name: "Alice Admin".into(), email: "alice@example.com".into(), ..Default::default() };
+        assert_eq!(display_name(&login), "alice", "iya-sts's username claim, not the subject");
+        let menu = user_menu(&login);
+        assert!(menu.contains("title=\"alice\">alice</span>") && menu.contains("Sign out alice"));
+        assert!(menu.contains("Alice Admin"), "the name is the detail line");
+        let preferred = Login { subject: "urn:uuid:1".into(), preferred_username: "bob".into(), ..Default::default() };
+        assert_eq!(display_name(&preferred), "bob", "preferred_username when there is no username claim");
+        let neither = Login { subject: "urn:uuid:2".into(), ..Default::default() };
+        assert_eq!(display_name(&neither), "urn:uuid:2", "the subject only when nothing else names them");
     }
 
     #[test]

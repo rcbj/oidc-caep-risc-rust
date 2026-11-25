@@ -69,3 +69,25 @@ ul.checks li { padding: 0.25rem 0; border-bottom: 1px solid var(--line); }
 pre.output { white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(127, 127, 127, 0.08); border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem; font-size: 0.82rem; }
 form.inline { display: inline-block; margin: 0.25rem 0.5rem 0.5rem 0; }
 details.card h3 { font-size: 1rem; margin: 1rem 0 0.25rem; }
+/* The top bar and its user menu, after the browser library's demo. */
+header.topbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.acct-menu { position: relative; font-size: 0.9rem; }
+.acct-menu > summary { list-style: none; display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.6rem 0.2rem 0.2rem; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; }
+.acct-menu > summary::-webkit-details-marker { display: none; }
+.acct-menu > summary:hover, .acct-menu[open] > summary { border-color: var(--accent); }
+.avatar { flex: none; width: 1.75rem; height: 1.75rem; border-radius: 50%; display: grid; place-items: center; font-weight: 600; font-size: 0.8rem; color: var(--accent); background: rgba(42, 93, 176, 0.12); }
+.avatar.plus { background: transparent; color: var(--muted); border: 1px dashed var(--line); }
+.menu-name { max-width: 18rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.caret { color: var(--muted); }
+.acct-menu .menu { position: absolute; right: 0; top: calc(100% + 0.4rem); z-index: 10; min-width: 18rem; max-width: 24rem; padding: 0.3rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15); }
+.menu-head { margin: 0.4rem 0.6rem 0.25rem; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.menu-row { display: flex; align-items: center; gap: 0.6rem; width: 100%; box-sizing: border-box; padding: 0.45rem 0.6rem; border: 0; border-radius: 6px; background: transparent; color: var(--fg); font: inherit; text-align: left; text-decoration: none; cursor: pointer; }
+.menu-row:hover, .menu-row:focus-visible { background: rgba(42, 93, 176, 0.1); outline: none; }
+.menu-row.static { cursor: default; }
+.menu-row.static:hover { background: transparent; }
+.menu-who { display: flex; flex-direction: column; min-width: 0; }
+.menu-who > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-note { margin: 0.2rem 0.6rem 0.4rem; }
+.menu-sep { height: 1px; background: var(--line); margin: 0.3rem 0.2rem; }
+.acct-menu form { margin: 0; }
+.small { font-size: 0.8rem; }
