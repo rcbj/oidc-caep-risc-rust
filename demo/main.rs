@@ -226,6 +226,36 @@ fn session_panes(rp: &RelyingParty, login: &Login, access_problem: Option<String
 
 /// `POST /session/userinfo`: calls UserInfo with the session's access token
 /// and keeps the answer for the Token cache pane.
+/// Fills a sign-in's empty `preferred_username`, `name` and `email` from
+/// UserInfo, writes the result back to the relying party's session cache,
+/// and keeps the answer for the Token cache pane.
+fn fill_from_userinfo(app: &Arc<App>, rp: &RelyingParty, sid: &str, login: &mut Login) {
+    let named = login.claims.get("username").and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty()) || !login.preferred_username.is_empty();
+    if named && !login.email.is_empty() {
+        return;
+    }
+    let text = match rp.userinfo(&login.access_token, &login.token_type, &login.subject) {
+        Ok(claims) => {
+            let get = |k: &str| claims.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            if login.preferred_username.is_empty() {
+                login.preferred_username = [get("preferred_username"), get("username")].into_iter().find(|v| !v.is_empty()).unwrap_or_default();
+            }
+            if login.name.is_empty() {
+                login.name = get("name");
+            }
+            if login.email.is_empty() {
+                login.email = get("email");
+            }
+            if let Some(store) = app.store.lock().unwrap().as_ref() {
+                store.set(sid, login.clone());
+            }
+            format!("UserInfo at sign-in, {}:\n{}", utc(now()), serde_json::to_string_pretty(&Value::Object(claims.into_iter().collect())).unwrap_or_default())
+        }
+        Err(err) => format!("UserInfo at sign-in refused, {}: {err}", utc(now())),
+    };
+    app.userinfo.lock().unwrap().insert(sid.to_string(), text);
+}
+
 fn session_userinfo(app: &Arc<App>, request: Request) {
     let sid = cookie_value(&request, "oidc_session");
     let (rp, _) = relying_party(app);
@@ -775,7 +805,14 @@ fn callback(app: &Arc<App>, request: Request, url: &str) {
     let sid = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &buf);
     // The tokens go in the relying party's session cache under the same id as the cookie.
     match rp.complete_session(&query, &txn, &sid) {
-        Ok(login) => {
+        Ok(mut login) => {
+            // With the code flow iya-sts puts no profile claims in the ID
+            // token (OpenID Connect Core 5.4: they are UserInfo's), so the
+            // name to show is asked of UserInfo once, here. Only the empty
+            // fields are filled, and the ID token's claims are left as the
+            // token says; UserInfo checks its `sub` is this sign-in's.
+            // A refused call costs the name, never the sign-in.
+            fill_from_userinfo(app, &rp, &sid, &mut login);
             if let Some(receiver) = app.receiver.lock().unwrap().as_ref() {
                 let mut session = serde_json::Map::new();
                 session.insert("local_id".into(), json!(sid));
