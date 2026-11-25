@@ -144,6 +144,8 @@ pub(crate) struct OpCfg {
     nonce_never_satisfied: bool,
     token_type: Option<String>,
     fail_refresh: bool,
+    /// The `sub` of the next sign-in; `user-1` when unset.
+    subject: Option<String>,
 }
 
 impl Default for OpCfg {
@@ -164,6 +166,7 @@ impl Default for OpCfg {
             nonce_never_satisfied: false,
             token_type: None,
             fail_refresh: false,
+            subject: None,
         }
     }
 }
@@ -189,6 +192,16 @@ pub(crate) struct Op {
     seen: Mutex<Vec<Seen>>,
     nonce_refusals: Mutex<i32>,
     token_calls: Mutex<i32>,
+}
+
+impl Op {
+    /// Whose the next sign-in is, and the `acr` its ID token carries (none
+    /// when `None`), for a test that signs several people in in turn.
+    pub(crate) fn sign_in_as(&self, subject: &str, acr: Option<&str>) {
+        let mut cfg = self.cfg.lock().unwrap();
+        cfg.subject = Some(subject.to_string());
+        cfg.acr = acr.map(str::to_string);
+    }
 }
 
 const AS_NONCE: &str = "as-nonce-1";
@@ -395,9 +408,10 @@ fn op_token(op: &Op, cfg: &OpCfg, req: &Req, jkt: &str) -> (u16, Vec<(String, St
 fn mint(op: &Op, cfg: &OpCfg, row: &HashMap<String, String>, jkt: &str, token_type: &str) -> Value {
     let access = format!("at-{}", rand::random::<u64>());
     let refresh = format!("rt-{}", rand::random::<u64>());
+    let subject = cfg.subject.clone().unwrap_or_else(|| "user-1".into());
     let mut payload = json!({
-        "iss": op.url, "sub": "user-1", "aud": CLIENT, "exp": now() + 300, "iat": now() + cfg.iat_offset,
-        "email": "user-1@example.com", "sid": "sid-1"
+        "iss": op.url, "sub": subject, "aud": CLIENT, "exp": now() + 300, "iat": now() + cfg.iat_offset,
+        "email": format!("{subject}@example.com"), "sid": "sid-1"
     });
     if !row.get("nonce").map(String::is_empty).unwrap_or(true) {
         payload["nonce"] = json!(row["nonce"]);
@@ -416,7 +430,7 @@ fn mint(op: &Op, cfg: &OpCfg, row: &HashMap<String, String>, jkt: &str, token_ty
 
 // ---- helpers ------------------------------------------------------------------------
 
-fn base(op: &Op, over: Value) -> JsonMap {
+pub(crate) fn base(op: &Op, over: Value) -> JsonMap {
     let mut doc = json!({
         "metadataUrl": format!("{}/.well-known/openid-configuration", op.url),
         "clientId": CLIENT,

@@ -31,6 +31,12 @@ pub use value::JsonMap;
 
 #[cfg(all(test, feature = "local"))]
 mod authzen_test;
+// The demo's PEP routes, driven in process: src/demo_pep_test.rs includes
+// demo/main.rs, which names this crate as an application does.
+#[cfg(all(test, feature = "local"))]
+extern crate self as oidc_caep_risc;
+#[cfg(all(test, feature = "local"))]
+mod demo_pep_test;
 #[cfg(all(test, feature = "pep"))]
 mod pep_test;
 #[cfg(test)]

@@ -385,7 +385,7 @@ fn events_panel(events: &[LiveEvent], stream: &str, notice: &str) -> String {
     format!("{notice}{scope}{stream_pane}{log_pane}")
 }
 
-struct App {
+pub(crate) struct App {
     sessions: Mutex<HashMap<String, Session>>,
     secret: Vec<u8>,
     secure: bool,
@@ -454,7 +454,18 @@ fn main() {
     } else {
         eprintln!("cannot read configuration: {config_path}");
     }
-    let app = Arc::new(App {
+    let app = new_app(config_path, public_url, public_given, secret, secure);
+    let server = tiny_http::Server::http(format!("0.0.0.0:{port}")).expect("bind");
+    println!("oidc-caep-risc-rust demo on port {port}");
+    serve(app, &server);
+}
+
+/// The demo's state for one configuration file, before any request: the
+/// relying party is made on the first request that needs it. `main` builds
+/// it from the environment and the command line; `src/demo_pep_test.rs`
+/// builds one for a stub provider.
+pub(crate) fn new_app(config_path: String, public_url: String, public_given: bool, secret: Vec<u8>, secure: bool) -> Arc<App> {
+    Arc::new(App {
         sessions: Mutex::new(HashMap::new()),
         secret,
         secure,
@@ -471,9 +482,12 @@ fn main() {
         store: Mutex::new(None),
         refreshes: Mutex::new(HashMap::new()),
         userinfo: Mutex::new(HashMap::new()),
-    });
-    let server = tiny_http::Server::http(format!("0.0.0.0:{port}")).expect("bind");
-    println!("oidc-caep-risc-rust demo on port {port}");
+    })
+}
+
+/// Answers every request `server` receives, each on its own thread, through
+/// `route`, until the server is dropped.
+pub(crate) fn serve(app: Arc<App>, server: &tiny_http::Server) {
     for request in server.incoming_requests() {
         let app = Arc::clone(&app);
         let _ = std::thread::spawn(move || route(app, request));
