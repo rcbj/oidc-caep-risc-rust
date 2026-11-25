@@ -158,7 +158,7 @@ LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 def usage():
     return """Usage: python scripts/configure_iya_sts.py [--config path] [--idp url] [--public-url url]
                                         [--test-user name | --no-test-user]
-                                        [--pep central|local] [--pep-name name] [--dry-run]
+                                        [--pep [local|central]] [--pep-name name] [--dry-run]
 
   --config        The demo's OpenID Connect configuration (default: demo/oidc.json)
   --idp           iya-sts's base URL; the realm's, e.g. https://host/realm/acme, for a trust realm
@@ -170,7 +170,9 @@ def usage():
                   $OIDC_DEMO_USER_PASSWORD, or one is generated and written to
                   generated/<user>.password beside the configuration (mode 0600); only
                   the path is printed. With that variable set, an existing user's
-                  password is replaced.
+                  password is replaced. The test user is given attr1=abc123 (the realm's
+                  custom attribute, defined with an admin:security token), which
+                  GET /attribute-protected is decided on.
   --no-test-user  Do not create a test user.
   --pep [MODE]    Also set up the embedded PEP in this mode, local (the default: it caches
                   the application's policies and decides in process) or central: its service
@@ -179,7 +181,9 @@ def usage():
                   application, the catalogue row subject.acr, the application's own policy
                   (permit read on an order with an acr; fine-grained authorization enforced),
                   and a `pep` section written into the configuration. Run it again to switch
-                  modes: an existing key, account and policy are kept.
+                  modes: an existing key and account are kept, and the script's own policy
+                  (OWN_POLICY_IDS) is written again with the current rules; any other policy
+                  is left alone.
   --pep-name      The PEP's service account (default: pep-oidc-demo).
   --dry-run       Print what would be done, and send nothing. Does not write a secret.
 
