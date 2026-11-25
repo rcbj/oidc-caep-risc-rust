@@ -337,17 +337,22 @@ fn events_panel(events: &[LiveEvent], stream: &str, notice: &str) -> String {
     let notice = if notice.is_empty() { String::new() } else { format!("<p class=\"notice\">{}</p>", esc(notice)) };
     // The one stream is the application's, so the log is too: a real
     // application shows a person only events about their own session or
-    // account, and keeps the rest from them.
-    let scope = "<p class=\"warning\"><strong>Every event this application received, for every user.</strong> This tab lists all the CAEP and RISC events the application's Shared Signals stream delivered: events about other people's sessions and accounts as well as yours. That is for this demonstration only. A real application must take additional safeguards: show a person only the events about their own session or account, and keep the others to the people whose job is to see them.</p>";
-    format!(
-        "{notice}{scope}<table class=\"facts\"><tr><th>Stream status</th><td id=\"stream-status\">{}</td></tr></table>\
-<form id=\"verify-form\" method=\"post\" action=\"/signals/verify\"><button type=\"submit\">Ask for a verification event</button></form>\
-<p><small>The CAEP and RISC events this application's receiver has accepted, about anybody, newest first, and the verification events it asked for. Each appears here within moments of the receiver getting it: <span id=\"live-state\">connecting…</span></small></p>\
+    // account, and keeps the rest from them. Each block is a collapsible
+    // pane, as on the other two tabs.
+    let scope = pane("events-scope", "Whose events these are", "", "<p class=\"warning\"><strong>Every event this application received, for every user.</strong> This tab lists all the CAEP and RISC events the application's Shared Signals stream delivered: events about other people's sessions and accounts as well as yours. That is for this demonstration only. A real application must take additional safeguards: show a person only the events about their own session or account, and keep the others to the people whose job is to see them.</p>");
+    let stream_pane = pane("events-stream", "Shared Signals stream", "", &format!(
+        "<table class=\"facts\"><tr><th>Stream status</th><td id=\"stream-status\">{}</td></tr><tr><th>Live</th><td id=\"live-state\">connecting…</td></tr></table>\
+<form id=\"verify-form\" method=\"post\" action=\"/signals/verify\"><button type=\"submit\">Ask for a verification event</button></form>",
+        esc(stream)
+    ));
+    let count = if events.is_empty() { String::new() } else { format!("{} event(s)", events.len()) };
+    let log_pane = pane("events-log", "Event log", &count, &format!(
+        "<p><small>The CAEP and RISC events this application's receiver has accepted, about anybody, newest first, and the verification events it asked for. Each appears here within moments of the receiver getting it.</small></p>\
 <ul class=\"log\" id=\"log\">{items}</ul>\
 <p class=\"empty\" id=\"log-empty\"{}>No CAEP or RISC event yet. At iya-sts, change this person's password (credential-change), sign them out (session-revoked), or disable them (account-disabled), and watch this tab.</p>",
-        esc(stream),
         if events.is_empty() { "" } else { " hidden" }
-    )
+    ));
+    format!("{notice}{scope}{stream_pane}{log_pane}")
 }
 
 struct App {
@@ -604,14 +609,14 @@ fn home(app: &Arc<App>, request: Request) {
         let toggle = "<p class=\"pane-tools\"><button type=\"button\" class=\"secondary small\" id=\"panes-toggle\" hidden>Collapse all</button></p>";
         let content = match tab.as_str() {
             "pep" => format!("{toggle}{}", format!("<div id=\"pep-panel\" aria-live=\"polite\">{}</div><script src=\"/pep.js\" defer></script>", pep_fragment(rp.as_ref()))),
-            "events" => {
+            "events" => format!("{toggle}{}", {
                 let notice = match query_param(request.url(), "verify").as_str() {
                     "sent" => "A verification event was requested; it appears below when the transmitter sends it.",
                     "refused" => "The transmitter refused the verification request.",
                     _ => "",
                 };
                 events_panel(&events, &app.state.lock().unwrap(), notice)
-            }
+            }),
             _ => format!("{toggle}{session_body}"),
         };
         let tab_link = |id: &str, href: &str, label: &str| {
@@ -1161,10 +1166,10 @@ fn human(d: Option<std::time::Duration>, ago: bool) -> String {
 fn pep_fragment(rp: Option<&Arc<RelyingParty>>) -> String {
     let v = pep_json(rp);
     if v["enabled"] != json!(true) {
-        return format!(
-            "<p class=\"notice\">No embedded PEP: {}. Add a <code>pep</code> section to the configuration and build with the <code>local</code> (or <code>pep</code>) feature; see <code>docs/remote-pep.md</code>.</p>",
+        return pane("pep-none", "No embedded PEP", "", &format!(
+            "<p class=\"notice\">No embedded PEP: {}. Add a <code>pep</code> section to the configuration (<code>python3 scripts/configure_iya_sts.py --pep local</code> sets one up) and build with the <code>local</code> (or <code>pep</code>) feature; see <code>docs/remote-pep.md</code>.</p>",
             esc(v["why"].as_str().unwrap_or(""))
-        );
+        ));
     }
     let text = |x: &Value| match x {
         Value::String(s) if s.is_empty() => "—".to_string(),
@@ -1227,7 +1232,7 @@ fn pep_fragment(rp: Option<&Arc<RelyingParty>>) -> String {
     let mut out = String::new();
     let problems = v["problems"].as_str().unwrap_or("");
     if !problems.is_empty() {
-        out.push_str(&format!("<p class=\"problem\">{}</p>", esc(problems)));
+        out.push_str(&pane("pep-problems", "Problems", "", &format!("<p class=\"problem\">{}</p>", esc(problems))));
     }
     for (title, rows) in cards {
         // Collapsible, as the Session tab's panes are; the id is stable so
@@ -1378,6 +1383,11 @@ mod tests {
         assert!(html.contains("id=\"log-empty\" hidden"), "the empty note hidden once there are events");
         assert!(html.contains("class=\"warning\"><strong>Every event this application received, for every user.</strong>"), "the tab says it is every user's events");
         assert!(html.contains("additional safeguards") && events_panel(&[], "", "").contains("for every user"), "with or without events");
+        for id in ["events-scope", "events-stream", "events-log"] {
+            assert!(html.contains(&format!("<details class=\"card pane\" id=\"{id}\" open>")), "{id} is a collapsible pane");
+        }
+        assert!(html.contains("id=\"live-state\"") && html.contains("id=\"verify-form\""), "app.js still finds what it updates");
+        assert!(pep_fragment(None).contains("<details class=\"card pane\" id=\"pep-none\" open>"), "the no-PEP notice is a pane too");
         assert!(events_panel(&[], "", "").contains("id=\"log-empty\">"), "and shown when there are none");
         assert!(!html.contains(">subject<"), "the subject member is the Subject line, not a row");
     }
