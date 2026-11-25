@@ -5,6 +5,14 @@
 The running container's PORT wins over the shell PORT. A loopback redirect follows that
 port. An explicit --public-url or PUBLIC_URL replaces the origin and keeps the path.
 The default http://localhost:3000 is not an explicit public URL.
+
+--pep central|local also sets the demo up with its embedded PEP, as
+docs/remote-pep.md's steps 2 to 6 describe: the PEP's service account in
+remote-peps, a P-256 key made here (demo/generated/pep-key.pem, 0600, never
+printed and never in the image), that key certified and the PEP bound to the
+demo's application, the catalogue row the demo's policy reads, the demo
+application's own policy (it enforces fine-grained authorization, so nothing
+realm-wide changes), and a `pep` section in the configuration.
 """
 
 import http.client
@@ -15,6 +23,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -24,6 +33,46 @@ ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "oidc-caep-risc-rust demo"
 MAX_BYTES = 2 * 1024 * 1024
 TIMEOUT_S = 15
+
+# The embedded PEP (--pep). The key's path is relative to the configuration's
+# directory here; the `pep` section names it as the demo process reads it,
+# from its working directory (the repository root, or /app in the image).
+PEP_MODES = ("central", "local")
+PEP_NAME = "pep-oidc-demo"
+PEP_KEY = "generated/pep-key.pem"
+PEP_KEY_IN_SECTION = "demo/generated/pep-key.pem"
+PEP_GROUP = "remote-peps"
+PEP_EVENT = "urn:iya:sts:secevent:event-type:pep-policies-changed"
+ACR_ATTRIBUTE = "urn:example:acr"
+
+
+def orders_policy(namespace="pepdemo", read_effect="permit"):
+    """ALFA for the demo's application: `read` on an `order` is `read_effect`,
+    and anything else is denied. `permit` also needs the subject's acr, which
+    only the catalogue row brings, so a Permit shows the claim arrived."""
+    condition = "            condition integerGreaterThan(stringBagSize(acr), 0)\n" if read_effect == "permit" else ""
+    return (
+        f"namespace {namespace} {{\n"
+        '    attribute act { category = actionCat\n'
+        '        id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }\n'
+        '    attribute rtype { category = resourceCat\n'
+        '        id = "urn:sts:xacml:authzen:resource-type" type = string }\n'
+        f'    attribute acr {{ category = subjectCat id = "{ACR_ATTRIBUTE}" type = string }}\n'
+        f"    policy {namespace}Orders {{\n"
+        f'        id = "urn:example:{namespace}-orders"\n'
+        "        apply firstApplicable\n"
+        "        rule readOrder {\n"
+        f"            {read_effect}\n"
+        '            target clause act == "read"\n'
+        '            target clause rtype == "order"\n'
+        f"{condition}"
+        "        }\n"
+        "        rule otherwise {\n"
+        "            deny\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
 
 
 def _ssl_context(tls):
@@ -82,7 +131,8 @@ LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
 def usage():
     return """Usage: python scripts/configure_iya_sts.py [--config path] [--idp url] [--public-url url]
-                                        [--test-user name | --no-test-user] [--dry-run]
+                                        [--test-user name | --no-test-user]
+                                        [--pep central|local] [--pep-name name] [--dry-run]
 
   --config        The demo's OpenID Connect configuration (default: demo/oidc.json)
   --idp           iya-sts's base URL; the realm's, e.g. https://host/realm/acme, for a trust realm
@@ -96,6 +146,15 @@ def usage():
                   the path is printed. With that variable set, an existing user's
                   password is replaced.
   --no-test-user  Do not create a test user.
+  --pep [MODE]    Also set up the embedded PEP in this mode, local (the default: it caches
+                  the application's policies and decides in process) or central: its service
+                  account, its key (generated/pep-key.pem beside the configuration, 0600,
+                  made here and never printed), the key certified and bound to the demo's
+                  application, the catalogue row subject.acr, the application's own policy
+                  (permit read on an order with an acr; fine-grained authorization enforced),
+                  and a `pep` section written into the configuration. Run it again to switch
+                  modes: an existing key, account and policy are kept.
+  --pep-name      The PEP's service account (default: pep-oidc-demo).
   --dry-run       Print what would be done, and send nothing. Does not write a secret.
 
 The management API secret is ADMIN_API_CLIENT_SECRET or STS_ADMIN_API_CLIENT_SECRET."""
@@ -165,6 +224,8 @@ def parse_args(argv, env=None):
         "dryRun": False,
         "help": False,
         "idpGiven": bool(env.get("IYA_STS_URL")),
+        "pep": "",
+        "pepName": PEP_NAME,
     }
     i = 0
     while i < len(argv):
@@ -191,6 +252,19 @@ def parse_args(argv, env=None):
             out["testUser"] = value().strip()
         elif arg == "--no-test-user":
             out["testUser"] = ""
+        elif arg == "--pep":
+            # The mode may be left out: then local, iya-pep's default (the
+            # PEP caches the application's policies and decides in process).
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                out["pep"] = value().strip()
+            else:
+                out["pep"] = "local"
+            if out["pep"] not in PEP_MODES:
+                raise RuntimeError(f"--pep must be central or local, not {out['pep']}")
+        elif arg == "--pep-name":
+            out["pepName"] = value().strip()
+            if not out["pepName"]:
+                raise RuntimeError("--pep-name is empty")
         elif arg == "--dry-run":
             out["dryRun"] = True
         else:
@@ -325,6 +399,9 @@ def plan_for(files, base, test_user):
             "body": {"application": files["clientId"], "attribute": "appAllowedProtocol", "value": protocol},
         })
     for attribute, raw in fields.items():
+        if attribute == "oauthClientId":
+            # The application's own name: already right on an existing one.
+            continue
         values = [str(item) for item in raw] if isinstance(raw, list) else [str(raw)]
         for value in values:
             calls.append({
@@ -414,6 +491,139 @@ def _write_private(path, value):
         out.write(f"{value}\n")
 
 
+def pep_plan(files, base, name, mode):
+    """What --pep does, for --dry-run. No key and no request leaves here."""
+    app = files["clientId"]
+    return [
+        f"GET  {base}/admin-api/users?user={name}  # create the service account unless it exists",
+        f"POST {base}/admin-api/users/create  # {name}: a service account, owned by admin-write, no credential",
+        f"POST {base}/admin-api/groups/add-member  # {name} in {PEP_GROUP}",
+        f"# make a P-256 key in {PEP_KEY} beside the configuration (0600) unless one is there",
+        f"POST {base}/admin-api/xacml/issue-pep-credential  # its certificate request, bound to {app} (a new key or account)",
+        f"POST {base}/admin-api/xacml/set-pep-application  # or, with both kept, the binding to {app} again",
+        f"POST {base}/admin-api/xacml/authzen/set-attribute  # subject.acr -> {ACR_ATTRIBUTE}",
+        f"POST {base}/admin-api/applications/fga-create-policy  # {app}'s own policy, unless it has one",
+        f"POST {base}/admin-api/xacml/import-alfa  # the demo policy into it (only when {app} does not yet enforce)",
+        f"POST {base}/admin-api/applications/fga-enable  # {app} enforces fine-grained authorization",
+        f"POST {base}/admin-api/applications/add  # {PEP_EVENT} in ssfAllowedEvents, only if {app} restricts them",
+        f"# write \"pep\": {{\"name\": \"{name}\", \"mode\": \"{mode}\", \"assertionKey\": \"{PEP_KEY_IN_SECTION}\"}} into the configuration",
+    ]
+
+
+def make_pep_key(key_file, name):
+    """A P-256 key made here with openssl, created 0600 (it is never printed,
+    and neither is its path's content). Answers nothing: the request is made
+    from the file by pep_csr()."""
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        made = subprocess.run(
+            ["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", str(key_file)],
+            check=False, capture_output=True, text=True,
+        )
+    finally:
+        os.umask(old)
+    if made.returncode != 0:
+        raise RuntimeError("openssl could not make the PEP's key (is openssl installed?)")
+    os.chmod(key_file, 0o600)
+
+
+def pep_csr(key_file, name):
+    """The key's certificate request, the only thing about it that is sent."""
+    with tempfile.TemporaryDirectory() as work:
+        csr = Path(work) / "pep.csr"
+        asked = subprocess.run(
+            ["openssl", "req", "-new", "-key", str(key_file), "-subj", f"/CN={name}", "-out", str(csr)],
+            check=False, capture_output=True, text=True,
+        )
+        if asked.returncode != 0:
+            raise RuntimeError("openssl could not make the PEP's certificate request from its key")
+        return csr.read_text(encoding="utf-8")
+
+
+def _ok(answer, what, allow=""):
+    """An /admin-api act that worked, or one refused only because it is
+    already so (`allow`, matched in the refusal's words)."""
+    body = answer["body"]
+    if answer["status"] == 200 and body.get("ok") is not False:
+        return True
+    words = " ".join(_errors_of(body)) + " " + str(body.get("why") or "")
+    if allow and allow in words.lower():
+        return False
+    raise RuntimeError(f"{what}: refused ({answer['status']}): {json.dumps(body)[:400]}")
+
+
+def write_pep_section(config_path, name, mode):
+    """The configuration's `pep` section: the name, the mode and the key's
+    path; any other member already there is kept."""
+    path = Path(config_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    section = raw.get("pep") if isinstance(raw.get("pep"), dict) else {}
+    section.update({"name": name, "mode": mode, "assertionKey": PEP_KEY_IN_SECTION})
+    raw["pep"] = section
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
+def setup_pep(api, files, config_path, name, mode):
+    """docs/remote-pep.md's steps 2 to 6. Safe to run again: an account, a
+    key and a policy already there are kept, and the binding is set again."""
+    app = files["clientId"]
+    # Step 2: the service account, in remote-peps.
+    found = api(f"/users?user={quote(name)}", None, "GET")
+    made_account = found["body"].get("known") is not True
+    if made_account:
+        _ok(api("/users/create", {
+            "username": name, "invent": False, "credential": "none", "serviceAccount": True,
+            "owners": ["admin-write"], "attributes": {"cn": name, "displayName": name},
+        }), f"creating the service account {name}")
+        print(f"Created the PEP's service account {name}.")
+    else:
+        print(f"The PEP's service account {name} already exists.")
+    _ok(api("/groups/add-member", {"group": PEP_GROUP, "member": name}), f"adding {name} to {PEP_GROUP}")
+    # Step 3: the key, certified from its own request, and the binding.
+    key_file = Path(config_path).resolve().parent / PEP_KEY
+    made_key = not key_file.exists()
+    if made_key:
+        make_pep_key(key_file, name)
+        print(f"Generated the PEP's P-256 key in {key_file} (readable by you only).")
+    if made_key or made_account:
+        issued = api("/xacml/issue-pep-credential", {"name": name, "csr": pep_csr(key_file, name), "application": app})
+        _ok(issued, "certifying the PEP's key")
+        print(f"Certified the PEP's key and bound {name} to {app}.")
+    else:
+        _ok(api("/xacml/set-pep-application", {"name": name, "application": app}), f"binding {name} to {app}")
+        print(f"Kept the PEP's key; {name} is bound to {app}.")
+    # Step 4: the claim the policy reads.
+    _ok(api("/xacml/authzen/set-attribute", {"object": "subject", "property": "acr", "attributeId": ACR_ATTRIBUTE}),
+        "the catalogue row subject.acr")
+    # Step 5: the application's own policy, written only the first time, so
+    # an administrator's edits survive a re-run.
+    page = api(f"/applications?application={quote(app, safe='')}", None, "GET")["body"].get("page") or {}
+    fga = page.get("fga") or {}
+    if fga.get("enforced") is True:
+        print(f"{app} already enforces its own policy; it is left as it is.")
+    else:
+        _ok(api("/applications/fga-create-policy", {"application": app}), f"{app}'s own policy", allow="already")
+        page = api(f"/applications?application={quote(app, safe='')}", None, "GET")["body"].get("page") or {}
+        fga = page.get("fga") or {}
+        policy = (fga.get("policy") or {}).get("name") or fga.get("reference")
+        if not policy:
+            raise RuntimeError(f"{app}'s page names no policy of its own: {json.dumps(fga)[:300]}")
+        _ok(api("/xacml/import-alfa", {"name": policy, "alfa": orders_policy()}), f"writing {policy}")
+        _ok(api("/applications/fga-enable", {"application": app}), f"enforcing {app}'s own policy")
+        print(f"{app} now enforces its own policy {policy}: read on an order needs an acr; anything else is denied.")
+    # Step 6: only an application that restricts its streams needs the event named.
+    allowed = (page.get("attributes") or {}).get("ssfAllowedEvents") or []
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    if allowed and PEP_EVENT not in allowed:
+        _ok(api("/applications/add", {"application": app, "attribute": "ssfAllowedEvents", "value": PEP_EVENT}),
+            "letting pep-policies-changed through ssfAllowedEvents", allow="already")
+        print(f"Added {PEP_EVENT} to {app}'s ssfAllowedEvents.")
+    write_pep_section(config_path, name, mode)
+    print(f"Wrote a {mode} pep section into {config_path}.")
+
+
 def container_port(cwd=None):
     """PORT from the running oidc-demo container, when compose has one."""
     cwd = str(cwd or ROOT)
@@ -473,6 +683,9 @@ def main(argv=None):
         for call in plan_for(files, base, args["testUser"]):
             printed = json.dumps(call.get("body") or {}, indent=2)
             print(f"{call['method']} {call['path']}  # {call['when']}: {call['why']}\n{printed}")
+        if args["pep"]:
+            for line in pep_plan(files, base, args["pepName"], args["pep"]):
+                print(line)
         return
     ca = None
     if files.get("tlsCa"):
@@ -518,6 +731,12 @@ def main(argv=None):
                 continue
             added = api(call["path"][len(f"{base}/admin-api"):], call["body"])
             errors = " ".join(_errors_of(added["body"]))
+            if not added["body"].get("ok") and "not one of the" in errors and call["path"].endswith("/applications/add"):
+                # A single-valued attribute `add` does not take (such as
+                # oauthIdTokenSignedResponseAlg) is SET instead; without this a
+                # second run against the same iya-sts stopped here.
+                added = api("/applications/set", call["body"])
+                errors = " ".join(_errors_of(added["body"]))
             if not added["body"].get("ok") and "already" not in errors.lower():
                 raise RuntimeError(f"{call['why']}: refused: {json.dumps(added['body'])[:400]}")
     else:
@@ -570,10 +789,14 @@ def main(argv=None):
                 raise RuntimeError(f"adding {args['testUser']} to a group was refused: {json.dumps(added['body'])[:300]}")
             group = (call["body"] or {}).get("group")
             print(f"{args['testUser']} {'was already' if added['body'].get('changed') is False else 'is now'} in {group}.")
+    if args["pep"]:
+        setup_pep(api, files, args["config"], args["pepName"], args["pep"])
     print(f"client_id: {files['clientId']}")
     print(f"metadata:  {files['metadataUrl']}")
     print(f"redirect:  {files['redirectUri']}")
     print(f"auth:      {files['tokenEndpointAuthMethod']}")
+    if args["pep"]:
+        print(f"pep:       {args['pepName']}, {args['pep']} (GET /orders/42 needs a sign-in with an acr; POST is denied)")
     print("Done. Start the demo with: docker compose up --build")
 
 

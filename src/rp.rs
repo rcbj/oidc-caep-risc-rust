@@ -381,6 +381,8 @@ pub struct RelyingParty {
     cc: Mutex<Option<(String, Access, f64)>>,
     sessions: RwLock<Arc<dyn SessionStore>>,
     refreshing: Mutex<()>,
+    #[cfg(feature = "pep")]
+    pep: Option<Arc<crate::pep::Pep>>,
 }
 
 impl RelyingParty {
@@ -476,6 +478,19 @@ impl RelyingParty {
             return Err(OidcError::new("discovery", "the provider requires pushed authorization requests and has no pushed authorization endpoint"));
         }
         let dpop = Self::dpop_key(&config, &metadata)?;
+        #[cfg(feature = "pep")]
+        let pep = crate::pep::build(&config, &metadata, key.as_ref(), dpop.as_ref())?;
+        #[cfg(not(feature = "pep"))]
+        if config.get("pep").is_some_and(|v| !v.is_null()) {
+            return Err(OidcError::new("config", "pep is configured, and this build has no embedded PEP (the oidc-caep-risc `pep` feature)"));
+        }
+        // Registration and (in local mode) the first pull, then the PEP's own
+        // thread. An unreachable service is retried there, and decisions are
+        // Unavailable until then.
+        #[cfg(feature = "pep")]
+        if let Some(pep) = &pep {
+            pep.start().map_err(|e| OidcError::new("config", e.message))?;
+        }
         let require_typ_at_hash = !matches!(config.get("requireIdTokenTypAndAtHash"), Some(Value::Bool(false)));
         let sessions: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new(
             config.get("sessionMaxEntries").and_then(|v| v.as_u64()).map_or(DEFAULT_SESSION_MAX_ENTRIES, |n| n as usize),
@@ -493,6 +508,8 @@ impl RelyingParty {
             cc: Mutex::new(None),
             sessions: RwLock::new(sessions),
             refreshing: Mutex::new(()),
+            #[cfg(feature = "pep")]
+            pep,
         })
     }
 
@@ -517,6 +534,33 @@ impl RelyingParty {
             return Ok(None);
         }
         Ok(Some(named.unwrap_or_else(Dpop::generate)))
+    }
+
+    /// The embedded PEP, when the configuration has a `pep` section.
+    #[cfg(feature = "pep")]
+    pub fn pep(&self) -> Option<&Arc<crate::pep::Pep>> {
+        self.pep.as_ref()
+    }
+
+    /// Decides one access for a sign-in with the embedded PEP. With no `pep`
+    /// section the answer is `Unavailable`: nothing here permits by default.
+    #[cfg(feature = "pep")]
+    pub fn decide(&self, login: &Login, access: &crate::pep::Access) -> crate::pep::Decision {
+        match &self.pep {
+            Some(pep) => pep.decide(&crate::pep::subject_of(login), access),
+            None => crate::pep::Decision::Unavailable { why: "no pep section is configured".into() },
+        }
+    }
+
+    /// `decide` for the sign-in kept under `session_id`. A session that ended
+    /// (signed out, expired, or ended by a CAEP `session-revoked`) has no
+    /// subject, and is denied without asking.
+    #[cfg(feature = "pep")]
+    pub fn decide_session(&self, session_id: &str, access: &crate::pep::Access) -> crate::pep::Decision {
+        match self.session(session_id) {
+            Some(login) => self.decide(&login, access),
+            None => crate::pep::Decision::Deny { why: "no signed-in session".into() },
+        }
     }
 
     /// True when this relying party sends DPoP proofs.
