@@ -1106,13 +1106,26 @@ fn page(title: &str, body: &str) -> String {
 /// A page, with the user menu in the top bar when someone is signed in.
 fn page_for(title: &str, body: &str, who: Option<&Login>) -> String {
     let menu = who.map(user_menu).unwrap_or_default();
+    let nav = if who.is_some() { site_nav() } else { String::new() };
     let script = if who.is_some() { "<script src=\"/menu.js\" defer></script>" } else { "" };
-    format!("<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title><link rel=\"stylesheet\" href=\"/styles.css\"></head>\n<body><header class=\"topbar\"><a href=\"/\">oidc-caep-risc demo</a>{menu}</header><main>\n{body}\n</main><footer>A traditional web application signing in with OpenID Connect through oidc-caep-risc.</footer>{script}</body>\n</html>\n", esc(title))
+    format!("<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title><link rel=\"stylesheet\" href=\"/styles.css\"></head>\n<body><header class=\"topbar\"><a href=\"/\">oidc-caep-risc demo</a>{nav}{menu}</header><main>\n{body}\n</main><footer>A traditional web application signing in with OpenID Connect through oidc-caep-risc.</footer>{script}</body>\n</html>\n", esc(title))
 }
 
-/// The sign-in's username: iya-sts's own `username` claim, which every ID
-/// token it issues carries, else `preferred_username` (a `profile` claim,
-/// issued only when that scope was granted). Empty when neither is there.
+/// The top bar's links between the demo's pages, for a signed-in person:
+/// the demo itself, and (with the embedded PEP) the two pages the PEP
+/// decides, so each is one click from the others.
+fn site_nav() -> String {
+    #[allow(unused_mut)]
+    let mut links = vec![("/", "Demo home")];
+    #[cfg(feature = "pep")]
+    links.extend([("/attribute-protected", "Attribute-protected"), ("/orders/42", "Order 42")]);
+    let items: Vec<String> = links.iter().map(|(href, label)| format!("<a href=\"{href}\">{label}</a>")).collect();
+    format!("<nav class=\"site-nav\" aria-label=\"Demo pages\">{}</nav>", items.join(""))
+}
+
+/// The sign-in's username: a `username` claim where the ID token carries
+/// one, else `preferred_username` (from the ID token, or filled from
+/// UserInfo at sign-in). Empty when neither is there.
 fn username_of(login: &Login) -> String {
     login.claims.get("username").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(str::to_string).unwrap_or_else(|| login.preferred_username.clone())
 }
@@ -1504,6 +1517,16 @@ mod tests {
         assert!(table.find(">amr<").unwrap() < table.find(">auth_time<").unwrap(), "sorted by name");
         assert_eq!(in_words(90.0), "1m 30s");
         assert_eq!(in_words(-3700.0), "1h 1m ago");
+    }
+
+    #[test]
+    fn the_top_bar_links_the_demo_pages_once_signed_in() {
+        let login = Login { subject: "urn:uuid:1".into(), preferred_username: "alice".into(), ..Login::default() };
+        let signed_in = page_for("t", "", Some(&login));
+        assert!(signed_in.contains("class=\"site-nav\"") && signed_in.contains("href=\"/\">Demo home</a>"), "{signed_in}");
+        #[cfg(feature = "pep")]
+        assert!(signed_in.contains("href=\"/attribute-protected\"") && signed_in.contains("href=\"/orders/42\""), "{signed_in}");
+        assert!(!page("t", "").contains("site-nav"), "nothing to link to before a sign-in");
     }
 
     #[test]

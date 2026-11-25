@@ -71,6 +71,9 @@ form.inline { display: inline-block; margin: 0.25rem 0.5rem 0.5rem 0; }
 details.card h3 { font-size: 1rem; margin: 1rem 0 0.25rem; }
 /* The top bar and its user menu, after the browser library's demo. */
 header.topbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.site-nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-right: auto; margin-left: 1.5rem; font-size: 0.9rem; }
+.site-nav a { text-decoration: none; }
+.site-nav a:hover, .site-nav a:focus-visible { text-decoration: underline; }
 .acct-menu { position: relative; font-size: 0.9rem; }
 .acct-menu > summary { list-style: none; display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.6rem 0.2rem 0.2rem; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; }
 .acct-menu > summary::-webkit-details-marker { display: none; }
