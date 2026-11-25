@@ -773,6 +773,8 @@ pub(crate) struct Transmitter {
     /// Every PATCH body, and whether PATCH is refused (405).
     pub(crate) patches: Mutex<Vec<Value>>,
     pub(crate) refuse_patch: Mutex<bool>,
+    /// When not 0, every poll is answered with this status (a transmitter down).
+    pub(crate) poll_status: Mutex<u16>,
 }
 
 /// A DPoP proof read and verified the way a server would (RFC 9449 section 4.3).
@@ -838,6 +840,7 @@ pub(crate) fn start_transmitter() -> &'static Transmitter {
         existing: Mutex::new(None),
         patches: Mutex::new(Vec::new()),
         refuse_patch: Mutex::new(false),
+        poll_status: Mutex::new(0),
     }));
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -936,6 +939,10 @@ fn handle_tx(tx: &Transmitter, req: &Req) -> (u16, Vec<(String, String)>, Vec<u8
         return (204, vec![], Vec::new());
     }
     if req.path.starts_with("/ssf/poll/") {
+        let failing = *tx.poll_status.lock().unwrap();
+        if failing != 0 {
+            return (failing, vec![], b"{\"err\":\"down\"}".to_vec());
+        }
         let doc: Value = serde_json::from_str(&req.body).unwrap_or(json!({}));
         if let Some(list) = doc.get("ack").and_then(|v| v.as_array()) {
             let mut acked = tx.acked.lock().unwrap();

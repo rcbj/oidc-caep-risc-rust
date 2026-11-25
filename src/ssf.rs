@@ -387,6 +387,19 @@ struct Shared {
     handlers: HashMap<String, Vec<Arc<dyn Fn(SignalEvent) + Send + Sync>>>,
     inflight_done: bool,
     inflight: Option<Arc<(Mutex<Option<Result<bool, String>>>, std::sync::Condvar)>>,
+    /// What the stream carries for the PEP (`requested` or `excluded`), once
+    /// known: a failed poll reports `down`, and the next good one this.
+    #[cfg(feature = "pep")]
+    pep_stream: Option<crate::pep::EventStream>,
+}
+
+/// Tells the relying party's PEP what its event stream is doing, so its
+/// heartbeat's `policyEvents` is true and it polls when it cannot hear.
+#[cfg(feature = "pep")]
+fn report_pep_stream(rp: Option<&Arc<RelyingParty>>, state: crate::pep::EventStream) {
+    if let Some(pep) = rp.and_then(|rp| rp.pep().cloned()).filter(|pep| crate::pep::wants_events(pep)) {
+        pep.set_event_stream(state);
+    }
 }
 
 /// Finds or creates this application's poll stream and turns events into local sessions.
@@ -464,6 +477,8 @@ impl SignalsReceiver {
                 handlers,
                 inflight_done: true,
                 inflight: None,
+                #[cfg(feature = "pep")]
+                pep_stream: None,
                 health: ReceiverHealth { poll_interval_ms: poll, ..ReceiverHealth::default() },
             })),
             stop: Arc::new((Mutex::new(false), Condvar::new())),
@@ -528,7 +543,9 @@ impl SignalsReceiver {
             let delivered = stream.get("events_delivered").and_then(Value::as_array).map(|list| list.iter().any(|v| v.as_str() == Some(crate::pep::POLICIES_CHANGED_EVENT)));
             let requested = stream.get("events_requested").and_then(Value::as_array).map(|list| list.iter().any(|v| v.as_str() == Some(crate::pep::POLICIES_CHANGED_EVENT)));
             let carried = delivered.or(requested).unwrap_or(true);
-            pep.set_event_stream(if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded });
+            let state = if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded };
+            pep.set_event_stream(state);
+            self.shared.lock().unwrap_or_else(|e| e.into_inner()).pep_stream = Some(state);
         }
         let endpoint = stream.get("delivery").and_then(as_map).map(|d| map_str(d, "endpoint_url")).unwrap_or_default();
         if endpoint.is_empty() {
@@ -562,6 +579,9 @@ impl SignalsReceiver {
             shared.running = false;
             shared.health.running = false;
         }
+        // A stopped receiver hears nothing: the PEP polls from now on.
+        #[cfg(feature = "pep")]
+        report_pep_stream(self.relying_party.as_ref(), crate::pep::EventStream::Down);
         {
             let (flag, wake) = &*self.stop;
             *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -732,6 +752,17 @@ impl Worker {
                 health.consecutive_failures += 1;
                 health.last_error = clip(&err.to_string(), 300);
                 health.last_error_at = Some(now);
+            }
+        }
+        // The PEP's view of the stream follows the polls: down while they
+        // fail (it polls its own policies instead), and what the stream
+        // carries again once one succeeds.
+        #[cfg(feature = "pep")]
+        {
+            let state = if result.is_ok() { shared.pep_stream } else { Some(crate::pep::EventStream::Down) };
+            drop(shared);
+            if let Some(state) = state {
+                report_pep_stream(self.relying_party.as_ref(), state);
             }
         }
     }
