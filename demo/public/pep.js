@@ -5,6 +5,10 @@
 // current, keeping closed any pane the person closed. The server escapes
 // everything in it. A hidden page doesn't poll;
 // a 401 means the session is gone, so it goes back to the sign-in page.
+// Its own scope: every page script shares one global scope, and two
+// top-level declarations of one name (app.js and pep.js both had `panel`)
+// make the second script fail to load at all.
+(() => {
 const panel = document.getElementById('pep-panel');
 const EVERY_MS = 2000;
 
@@ -36,3 +40,4 @@ if (panel) {
   setInterval(refresh, EVERY_MS);
   document.addEventListener('visibilitychange', refresh);
 }
+})();

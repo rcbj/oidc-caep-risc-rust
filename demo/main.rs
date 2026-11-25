@@ -1459,6 +1459,19 @@ mod tests {
     }
 
     #[test]
+    fn every_page_script_keeps_its_names_to_itself() {
+        // The page's scripts share one global scope: two top-level `const
+        // panel` (app.js and pep.js, then panes.js) made the later ones fail
+        // to load, and Collapse all did nothing. Each is its own function.
+        for (name, src) in [("app.js", include_str!("public/app.js")), ("pep.js", include_str!("public/pep.js")), ("panes.js", include_str!("public/panes.js")), ("menu.js", include_str!("public/menu.js"))] {
+            let code: Vec<&str> = src.lines().filter(|l| !l.trim_start().starts_with("//") && !l.trim().is_empty()).collect();
+            assert_eq!(code.first().copied(), Some("(() => {"), "{name} opens its own scope");
+            assert_eq!(code.last().copied(), Some("})();"), "{name} closes it");
+        }
+        assert!(include_str!("public/styles.css").contains("[hidden] { display: none !important; }"), "hidden hides a button too");
+    }
+
+    #[test]
     fn query_param_reads_one_parameter() {
         assert_eq!(query_param("/?tab=pep&x=1", "tab"), "pep");
         assert_eq!(query_param("/", "tab"), "");

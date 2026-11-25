@@ -5,6 +5,10 @@
 // nothing else. It is hidden until this script runs: without a script every
 // pane still opens and closes by itself. Its label says what it will do:
 // Collapse all while any pane is open, Expand all once they are all closed.
+// Its own scope: every page script shares one global scope, and two
+// top-level declarations of one name (app.js and pep.js both had `panel`)
+// make the second script fail to load at all.
+(() => {
 const toggle = document.getElementById('panes-toggle');
 const panel = document.getElementById('panel');
 
@@ -30,3 +34,4 @@ if (toggle && panel) {
   document.addEventListener('panes-redrawn', label);
   label();
 }
+})();
