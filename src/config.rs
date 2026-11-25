@@ -203,6 +203,14 @@ pub fn resolve_config(raw: &JsonMap, base_dir: &str) -> Result<Resolved, OidcErr
                 if doc.get("pollIntervalMs").is_some_and(truthy) {
                     block.insert("pollIntervalMs".into(), doc.get("pollIntervalMs").cloned().unwrap_or(Value::Null));
                 }
+                // Add Subject / Remove Subject (SignalsReceiver; default on).
+                match doc.get("addSubjects") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Bool(flag)) => {
+                        block.insert("addSubjects".into(), Value::Bool(*flag));
+                    }
+                    Some(_) => return Err(OidcError::new("config", "ssf.addSubjects must be true or false")),
+                }
                 ssf = Some(block);
             }
         }
@@ -309,7 +317,7 @@ fn words(value: &Value) -> Option<Vec<String>> {
 /// `par` and `dpop` (auto), `clockToleranceSec` (30), `maxIdTokenAgeSec` (600),
 /// `idTokenSigningAlgs` (`["RS256"]`), `requireIdTokenTypAndAtHash` (true),
 /// `sessionMaxEntries` (10000) and `sessionTtlSec` (86400, 0 for no expiry) for the
-/// default session store, and the
+/// default session store, `ssf.addSubjects` (a boolean when present), and the
 /// redirect URI rule (https, or http on `localhost`, `127.0.0.1`, or `[::1]`).
 pub fn apply_defaults(config: &mut JsonMap) -> Result<(), OidcError> {
     mode(config, "par")?;
@@ -318,6 +326,12 @@ pub fn apply_defaults(config: &mut JsonMap) -> Result<(), OidcError> {
     seconds(config, "maxIdTokenAgeSec", 600)?;
     whole(config, "sessionMaxEntries", crate::rp::DEFAULT_SESSION_MAX_ENTRIES as u64, 1)?;
     whole(config, "sessionTtlSec", crate::rp::DEFAULT_SESSION_TTL_SEC, 0)?;
+    // ssf.addSubjects (default true): SignalsReceiver's Add / Remove Subject.
+    if let Some(flag) = config.get("ssf").and_then(|ssf| ssf.get("addSubjects")).filter(|v| !v.is_null()) {
+        if !flag.is_boolean() {
+            return Err(OidcError::new("config", "ssf.addSubjects must be true or false"));
+        }
+    }
     let algs = match config.get("idTokenSigningAlgs").filter(|v| !v.is_null()) {
         None => vec!["RS256".to_string()],
         Some(value) => words(value).ok_or_else(|| OidcError::new("config", "idTokenSigningAlgs must be a list of algorithm names"))?,

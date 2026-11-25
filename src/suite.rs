@@ -112,6 +112,9 @@ pub(crate) struct Stub {
 }
 
 pub(crate) fn start_provider() -> &'static Stub {
+    // The provider's RSA key before the stub answers: made inside the first
+    // /jwks it can outlast the client's 15 s timeout on a busy runner (#41).
+    keys();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let stub: &'static Stub = Box::leak(Box::new(Stub {
@@ -775,6 +778,13 @@ pub(crate) struct Transmitter {
     pub(crate) refuse_patch: Mutex<bool>,
     /// When not 0, every poll is answered with this status (a transmitter down).
     pub(crate) poll_status: Mutex<u16>,
+    /// Whether the configuration publishes add_subject_endpoint and
+    /// remove_subject_endpoint (SSF 1.0 sections 8.1.3.2 and 8.1.3.3).
+    pub(crate) subject_endpoints: Mutex<bool>,
+    /// When not 0, every Add/Remove Subject is answered with this status.
+    pub(crate) subject_status: Mutex<u16>,
+    /// Every Add/Remove Subject call, in order: "add" or "remove", and its body.
+    pub(crate) subject_calls: Mutex<Vec<(String, Value)>>,
 }
 
 /// A DPoP proof read and verified the way a server would (RFC 9449 section 4.3).
@@ -841,6 +851,9 @@ pub(crate) fn start_transmitter() -> &'static Transmitter {
         patches: Mutex::new(Vec::new()),
         refuse_patch: Mutex::new(false),
         poll_status: Mutex::new(0),
+        subject_endpoints: Mutex::new(false),
+        subject_status: Mutex::new(0),
+        subject_calls: Mutex::new(Vec::new()),
     }));
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -884,13 +897,29 @@ fn handle_tx(tx: &Transmitter, req: &Req) -> (u16, Vec<(String, String)>, Vec<u8
         return json_res(401, json!({"error": "invalid_token"}));
     }
     if req.path == "/.well-known/ssf-configuration" {
-        return json_res(200, json!({
+        let mut config = json!({
             "issuer": tx.url,
             "jwks_uri": format!("{}/jwks", tx.url),
             "configuration_endpoint": format!("{}/ssf/stream", tx.url),
             "verification_endpoint": format!("{}/ssf/verify", tx.url),
             "delivery_methods_supported": ["urn:ietf:rfc:8936"]
-        }));
+        });
+        if *tx.subject_endpoints.lock().unwrap() {
+            config["add_subject_endpoint"] = json!(format!("{}/ssf/subjects:add", tx.url));
+            config["remove_subject_endpoint"] = json!(format!("{}/ssf/subjects:remove", tx.url));
+        }
+        return json_res(200, config);
+    }
+    if (req.path == "/ssf/subjects:add" || req.path == "/ssf/subjects:remove") && req.method == "POST" {
+        let doc: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
+        let kind = if req.path.ends_with("add") { "add" } else { "remove" };
+        tx.subject_calls.lock().unwrap().push((kind.to_string(), doc));
+        let status = *tx.subject_status.lock().unwrap();
+        if status != 0 {
+            return json_res(status, json!({"err": "access_denied", "description": "no active session for this subject"}));
+        }
+        // SSF 1.0: Add Subject answers 200, Remove Subject 204.
+        return if kind == "add" { json_res(200, json!({})) } else { (204, vec![], Vec::new()) };
     }
     if req.path == "/jwks" {
         return json_res(200, json!({"keys": [ssf_keys().jwk]}));
