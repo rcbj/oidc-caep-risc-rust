@@ -330,7 +330,11 @@ pub struct ReceiverOptions {
     /// Tell the transmitter which people this application follows (SSF 1.0
     /// sections 8.1.3.2 and 8.1.3.3): Add Subject when `track` follows a
     /// person's sign-in, Remove Subject when the last one `track`ed for that
-    /// person ends (`untrack`, or an event that ends it). Default `true`.
+    /// person ends (`untrack`, or an event that ends it); and, when the
+    /// relying party's PEP wants events, the application
+    /// (`{format: opaque, id}`) at `start`, never removed, so
+    /// `pep-policies-changed` still reaches a stream that names people.
+    /// Default `true`.
     /// A relying party whose configuration says `ssf.addSubjects: false`
     /// turns it off too. Skipped when the transmitter publishes no
     /// `add_subject_endpoint` (or `remove_subject_endpoint`) and while the
@@ -629,6 +633,17 @@ impl SignalsReceiver {
         }
         *self.stop.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
         let worker = self.worker();
+        // A transmitter narrows a stream that names subjects to those
+        // subjects (iya-sts under default_subjects ALL; SSF 1.0 8.1.3), and
+        // pep-policies-changed is about the application the PEP is embedded
+        // in (a complex subject whose `application` member is
+        // {format: opaque, id: <application>}). Once people are added the
+        // stream would stop carrying it, so the application is named too,
+        // here, and never removed.
+        #[cfg(feature = "pep")]
+        if let Some(pep) = self.relying_party.as_ref().and_then(|rp| rp.pep().cloned()).filter(|pep| crate::pep::wants_events(pep)) {
+            worker.application_added(&pep.config().application);
+        }
         // The people tracked before the stream was known: Add Subject now.
         let tracked: Vec<JsonMap> = self.index.lock().unwrap_or_else(|e| e.into_inner()).live();
         for session in &tracked {
@@ -775,6 +790,20 @@ impl Worker {
         if self.subject_call(&endpoint, &body, &what, true) {
             self.added.lock().unwrap_or_else(|e| e.into_inner()).insert(key);
         }
+    }
+
+    /// Add Subject for the application this receiver's PEP hears about, so
+    /// `pep-policies-changed` still reaches a stream that names people. The
+    /// application is this receiver's own, hence `verified`.
+    #[cfg(feature = "pep")]
+    fn application_added(&self, application: &str) {
+        if !self.add_subjects || application.is_empty() {
+            return;
+        }
+        let Some((endpoint, stream_id)) = self.subject_endpoint("add_subject_endpoint") else { return };
+        let body = serde_json::json!({"stream_id": stream_id, "subject": {"format": "opaque", "id": application}, "verified": true});
+        let what = format!("Add Subject (opaque) for the application on stream {stream_id}");
+        self.subject_call(&endpoint, &body, &what, true);
     }
 
     /// Remove Subject for `session`'s person (already untracked) when no
