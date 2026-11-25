@@ -624,7 +624,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "iya-pep"
 version = "0.1.0"
-source = "git+https://github.com/rcbj/iya-pep-rust?branch=feature%2F1#c0d61cadaec669279fad485ece988e9af934ab8d"
+source = "git+https://github.com/rcbj/iya-pep-rust?branch=feature%2F1#d88edef7acf8163e41c21a8fe3cefb16b6305121"
 dependencies = [
  "base64",
  "native-tls",

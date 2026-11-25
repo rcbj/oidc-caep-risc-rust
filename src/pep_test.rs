@@ -102,7 +102,9 @@ fn ec_pem(seed: u8) -> String {
 }
 
 fn pep_section(pdp: &Pdp, tag: &str, extra: Value) -> Value {
-    let mut section = json!({"name": "pep-demo", "assertionKey": key_file(tag, &ec_pem(5)), "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000});
+    // central by name: these tests ask the stub PDP for each decision, and
+    // a section that names no mode is local (iya-pep's default).
+    let mut section = json!({"name": "pep-demo", "mode": "central", "assertionKey": key_file(tag, &ec_pem(5)), "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000});
     for (k, v) in extra.as_object().unwrap() {
         section[k] = v.clone();
     }
@@ -349,8 +351,9 @@ fn a_reused_stream_gets_the_policy_event_added() {
         ..ReceiverOptions::default()
     }).unwrap();
     refused.start().unwrap();
-    refused.stop();
     assert!(errors.lock().unwrap().iter().any(|l| l.contains("answered 405")), "{:?}", errors.lock().unwrap());
+    let pep = rp.pep().cloned().unwrap();
+    assert_eq!(pep.status().event_stream, crate::pep::EventStream::Excluded, "running, and the stream does not carry the event");
     let before = pdp.count("/xacml/pep/heartbeat");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while pdp.count("/xacml/pep/heartbeat") <= before && std::time::Instant::now() < deadline {
@@ -358,6 +361,32 @@ fn a_reused_stream_gets_the_policy_event_added() {
     }
     let beats = pdp.bodies("/xacml/pep/heartbeat");
     assert_eq!(beats.last().unwrap()["policyEvents"], "excluded", "{beats:?}");
+    refused.stop();
+    assert_eq!(pep.status().event_stream, crate::pep::EventStream::Down, "a stopped receiver hears nothing");
+}
+
+/// The PEP's view of the stream follows the receiver's polls: a failed poll
+/// is `down` (the PEP then polls its own policies), and the next good one
+/// is what the stream carries again.
+#[test]
+fn the_peps_stream_state_follows_the_polls() {
+    let pdp = start_pdp();
+    let tx = start_transmitter();
+    let op = crate::profile_test::start_op(crate::profile_test::dpop_cfg());
+    let rp = Arc::new(crate::profile_test::rp_for(op, json!({"pep": pep_section(pdp, "polls", json!({"permitCacheMs": 30000}))})));
+    let receiver = SignalsReceiver::new(&tx.url, Arc::new(|_, _| {}), ReceiverOptions { relying_party: Some(Arc::clone(&rp)), poll_interval_ms: 60_000, ..ReceiverOptions::default() }).unwrap();
+    let pep = rp.pep().cloned().unwrap();
+    assert_eq!(pep.status().event_stream, crate::pep::EventStream::Down, "nothing reported before the receiver starts");
+    receiver.start().unwrap();
+    assert_eq!(pep.status().event_stream, crate::pep::EventStream::Requested);
+    *tx.poll_status.lock().unwrap() = 503;
+    assert!(receiver.poll_once().is_err());
+    assert_eq!(pep.status().event_stream, crate::pep::EventStream::Down, "a failed poll: down");
+    *tx.poll_status.lock().unwrap() = 0;
+    receiver.poll_once().unwrap();
+    assert_eq!(pep.status().event_stream, crate::pep::EventStream::Requested, "a good poll: what the stream carries");
+    receiver.stop();
+    assert_eq!(pep.status().event_stream, crate::pep::EventStream::Down);
 }
 
 #[cfg(feature = "local")]
@@ -380,4 +409,17 @@ fn local_mode_fails_closed_then_decides_in_process() {
     assert!(matches!(rp.decide(&login(), &Access::new("write", "order", "42")), Decision::Deny { .. }));
     assert_eq!(pdp.count("/access/v1/evaluation"), 0, "decided in process");
     assert!(pdp.seen.lock().unwrap().iter().any(|(_, p, _)| p == "/xacml/pep/policies"));
+}
+
+/// A `pep` section that names no mode is `local`: the PEP pulls the
+/// application's policies and decides in process.
+#[cfg(feature = "local")]
+#[test]
+fn a_section_without_a_mode_is_local() {
+    let op = start_provider();
+    let pdp = start_pdp();
+    let mut section = pep_section(pdp, "default-mode", json!({}));
+    section.as_object_mut().unwrap().remove("mode");
+    let rp = RelyingParty::create(provider_config(op, json!({"signals": false, "pep": section}))).unwrap();
+    assert_eq!(rp.pep().unwrap().status().mode, crate::pep::Mode::Local);
 }

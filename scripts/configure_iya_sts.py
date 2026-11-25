@@ -172,7 +172,8 @@ def usage():
                   the path is printed. With that variable set, an existing user's
                   password is replaced.
   --no-test-user  Do not create a test user.
-  --pep           Also set up the embedded PEP in this mode (central or local): its service
+  --pep [MODE]    Also set up the embedded PEP in this mode, local (the default: it caches
+                  the application's policies and decides in process) or central: its service
                   account, its key (generated/pep-key.pem beside the configuration, 0600,
                   made here and never printed), the key certified and bound to the demo's
                   application, the catalogue row subject.acr, the application's own policy
@@ -278,7 +279,12 @@ def parse_args(argv, env=None):
         elif arg == "--no-test-user":
             out["testUser"] = ""
         elif arg == "--pep":
-            out["pep"] = value().strip()
+            # The mode may be left out: then local, iya-pep's default (the
+            # PEP caches the application's policies and decides in process).
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                out["pep"] = value().strip()
+            else:
+                out["pep"] = "local"
             if out["pep"] not in PEP_MODES:
                 raise RuntimeError(f"--pep must be central or local, not {out['pep']}")
         elif arg == "--pep-name":

@@ -136,7 +136,7 @@ Add a `pep` section to `oidc.json`. The PEP is off unless it is present.
 | Member | Default here | What it is |
 |---|---|---|
 | `name` | required | The PEP's service account (step 2). |
-| `mode` | `central` | `central` or `local`. |
+| `mode` | `local` | `local` (the PEP pulls its application's policies, caches them in memory and decides in process) or `central` (it asks iya-sts for every decision). |
 | `assertionKey` | required | The PEP's private key in PEM: a path; a relative one is read from the process's working directory. The file is re-read when it changes. |
 | `pdpUrl` | the provider's `issuer` (the realm prefix included) | iya-sts, with `/realm/<id>` for a realm. |
 | `application` | `clientId` | The application the PEP is bound to (step 3). |
