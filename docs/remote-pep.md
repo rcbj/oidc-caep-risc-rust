@@ -176,7 +176,7 @@ match rp.decide_session(&session_id, &access) {
 
 **The subject** comes from the sign-in, never from a request header:
 
-- **id:** `preferred_username`, else `sub`. iya-sts's PIP resolves a username, a DN or a certificate subject, and `preferred_username` is the directory username.
+- **id:** the username: iya-sts's `username` claim, else `preferred_username`, else `sub`. iya-sts's PIP resolves a username, a DN or a certificate subject. Every ID token iya-sts issues carries `username`; `preferred_username` is a `profile` claim, there only when that scope was granted.
 - **properties:** every ID token claim (`acr`, `amr`, `auth_time`, `email`, …). `subject_with_userinfo(&login, &userinfo)` lays fetched userinfo claims over them.
 
 Only the properties the catalogue declares are sent.
