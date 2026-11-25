@@ -573,24 +573,27 @@ def set_test_attribute(api, user):
             raise
         defined = {"status": 403, "body": {"errors": ["Only a Security Administrator may make this change"]}}
     words = " ".join(_errors_of(defined["body"])).lower()
-    if defined["status"] == 403 and "security administrator" in words:
-        print(f"The custom attribute {TEST_ATTRIBUTE} could not be defined with this credential: only a Security")
-        print("Administrator may change the attribute policy. Sign in to the console as one (the bootstrap")
-        print(f"administrator is), open Directory > Policies > Attribute policy > Custom attributes, and add")
-        print(f"{TEST_ATTRIBUTE} (label \"Attribute 1\", syntax string, one value). Then run this script again to give")
-        print(f"{user} {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}. (If {TEST_ATTRIBUTE} is defined already, the value is set below.)")
-    elif not (defined["status"] == 200 and defined["body"].get("ok") is not False):
+    not_allowed = defined["status"] == 403 and "security administrator" in words
+    if not not_allowed and not (defined["status"] == 200 and defined["body"].get("ok") is not False):
         if "already" not in words and "exists" not in words:
             raise RuntimeError(f"defining the custom attribute {TEST_ATTRIBUTE}: refused ({defined['status']}): {json.dumps(defined['body'])[:400]}")
     try:
         answered = api("/users/set-attribute", {"user": user, "attribute": TEST_ATTRIBUTE, "value": TEST_ATTRIBUTE_VALUE})
     except RuntimeError as err:
-        print(f"{user} does not have {TEST_ATTRIBUTE} yet: {str(err)[:300]}")
-        return False
+        answered = {"status": 0, "body": {"errors": [str(err)]}}
     if answered["status"] == 200 and answered["body"].get("ok") is not False:
         print(f"{user} has {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE} (a custom attribute of the realm).")
         return True
-    print(f"{user} does not have {TEST_ATTRIBUTE} yet: {' '.join(_errors_of(answered['body']))[:300]}")
+    if not_allowed:
+        # Only now does the refusal matter: the attribute is not defined,
+        # and this credential cannot define it.
+        print(f"The custom attribute {TEST_ATTRIBUTE} is not defined, and this credential cannot define it:")
+        print("only a Security Administrator may change the attribute policy. Sign in to the console as one")
+        print("(the bootstrap administrator is), open Directory > Policies > Attribute policy > Custom")
+        print(f"attributes, and add {TEST_ATTRIBUTE} (label \"Attribute 1\", syntax string, one value). Then run")
+        print(f"this script again to give {user} {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}.")
+    else:
+        print(f"{user} does not have {TEST_ATTRIBUTE} yet: {' '.join(_errors_of(answered['body']))[:300]}")
     return False
 
 
