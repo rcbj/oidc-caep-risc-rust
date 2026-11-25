@@ -44,6 +44,8 @@ mod profile_test;
 #[cfg(test)]
 mod proxy_gaps_test;
 #[cfg(test)]
+mod subjects_test;
+#[cfg(test)]
 mod suite;
 #[cfg(test)]
 mod trust_chain_test;
