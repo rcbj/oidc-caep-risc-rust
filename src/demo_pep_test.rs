@@ -301,7 +301,10 @@ fn the_demo_follows_every_sign_in_at_the_transmitter() {
     let demo = start_demo_with("subjects", json!({"ssf": {"transmitter": tx.url, "pollIntervalMs": 60000}}));
     let calls = || tx.subject_calls.lock().unwrap().clone();
     let subject = |person: &str| json!({"format": "iss_sub", "iss": tx.url, "sub": person});
-    let added = || calls().into_iter().filter(|(kind, _)| kind == "add").map(|(_, body)| body["subject"].clone()).collect::<Vec<_>>();
+    // People only: the demo's local PEP wants events, so the receiver also
+    // names the application at start (never removed).
+    let application = json!({"format": "opaque", "id": "oidc-caep-risc-demo"});
+    let added = || calls().into_iter().filter(|(kind, body)| kind == "add" && body["subject"]["format"] == "iss_sub").map(|(_, body)| body["subject"].clone()).collect::<Vec<_>>();
     let removed = || calls().into_iter().filter(|(kind, _)| kind == "remove").map(|(_, body)| body["subject"].clone()).collect::<Vec<_>>();
 
     let first = sign_in(&demo, ALLOWED, Some(ACR));
@@ -311,7 +314,8 @@ fn the_demo_follows_every_sign_in_at_the_transmitter() {
     let second = sign_in(&demo, DENIED, Some(ACR));
     let third = sign_in(&demo, ALLOWED, Some(ACR));
     assert_eq!(added(), vec![subject(ALLOWED), subject(DENIED)], "a later person is added too; a person already added is not added again");
-    assert_eq!(calls()[0].1["verified"], json!(true));
+    assert_eq!(calls()[0], ("add".to_string(), json!({"stream_id": "s1", "subject": application, "verified": true})), "the application first, at start");
+    assert!(calls().iter().all(|(kind, body)| kind != "add" || body["verified"] == json!(true)));
 
     assert_eq!(call(&demo, "POST", "/logout", &first).status, 303);
     assert!(removed().is_empty(), "the allowed user is still signed in here (the third sign-in)");
@@ -319,4 +323,5 @@ fn the_demo_follows_every_sign_in_at_the_transmitter() {
     assert_eq!(removed(), vec![subject(DENIED)]);
     assert_eq!(call(&demo, "POST", "/logout", &third).status, 303);
     assert_eq!(removed(), vec![subject(DENIED), subject(ALLOWED)], "the allowed user's last sign-in ended");
+    assert!(!removed().contains(&application), "the application is never removed");
 }
