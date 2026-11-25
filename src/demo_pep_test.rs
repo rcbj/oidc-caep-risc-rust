@@ -53,6 +53,11 @@ struct Demo {
 
 /// The demo, with a `local` `pep` section, on its own stub provider and PDP.
 fn start_demo(tag: &str) -> Demo {
+    start_demo_with(tag, json!({"signals": false}))
+}
+
+/// The same, with `extra` laid over the configuration (`ssf`, `signals`).
+fn start_demo_with(tag: &str, extra: Value) -> Demo {
     let table: &'static Value = Box::leak(Box::new(serde_json::from_str(TABLE).expect("src/tests/demo_pep_policy.json is JSON")));
     let op = start_op(OpCfg::default());
     let pdp = start_pdp(table);
@@ -61,7 +66,9 @@ fn start_demo(tag: &str) -> Demo {
         "name": "pep-az-demo-local", "mode": "local", "assertionKey": key_file(&format!("demo-{tag}"), 41),
         "pdpUrl": pdp.url, "pollIntervalMs": 1000, "heartbeatIntervalMs": 10000,
     });
-    let config = base(op, json!({"signals": false, "pep": section}));
+    let mut over = extra;
+    over["pep"] = section;
+    let config = base(op, over);
     let path = std::env::temp_dir().join(format!("oidc-demo-pep-{tag}-{}.json", std::process::id()));
     std::fs::write(&path, Value::Object(config).to_string()).unwrap();
     let config = path.to_string_lossy().into_owned();
@@ -281,4 +288,35 @@ fn signed_out_is_401_on_both_pages() {
     for (method, path) in [("GET", "/attribute-protected"), ("GET", "/orders/42")] {
         assert_eq!(call(&demo, method, path, &cookie).status, 401, "{method} {path} after sign-out");
     }
+}
+
+/// Every sign-in is followed at the transmitter, not only the one that
+/// started the receiver (gnap-caep-risc-rust #44 found its demo tracked
+/// only that one): `/callback` tracks each, so Add Subject goes for each
+/// person, and Sign out withdraws a person once their last sign-in here ends.
+#[test]
+fn the_demo_follows_every_sign_in_at_the_transmitter() {
+    let tx = crate::suite::start_transmitter();
+    *tx.subject_endpoints.lock().unwrap() = true;
+    let demo = start_demo_with("subjects", json!({"ssf": {"transmitter": tx.url, "pollIntervalMs": 60000}}));
+    let calls = || tx.subject_calls.lock().unwrap().clone();
+    let subject = |person: &str| json!({"format": "iss_sub", "iss": tx.url, "sub": person});
+    let added = || calls().into_iter().filter(|(kind, _)| kind == "add").map(|(_, body)| body["subject"].clone()).collect::<Vec<_>>();
+    let removed = || calls().into_iter().filter(|(kind, _)| kind == "remove").map(|(_, body)| body["subject"].clone()).collect::<Vec<_>>();
+
+    let first = sign_in(&demo, ALLOWED, Some(ACR));
+    let status: Value = serde_json::from_str(&call(&demo, "GET", "/live-status", &first).body).unwrap();
+    assert!(status["receiver"].as_str().unwrap_or("").starts_with("polling stream"), "the receiver runs: {status}");
+    assert_eq!(added(), vec![subject(ALLOWED)], "the first sign-in");
+    let second = sign_in(&demo, DENIED, Some(ACR));
+    let third = sign_in(&demo, ALLOWED, Some(ACR));
+    assert_eq!(added(), vec![subject(ALLOWED), subject(DENIED)], "a later person is added too; a person already added is not added again");
+    assert_eq!(calls()[0].1["verified"], json!(true));
+
+    assert_eq!(call(&demo, "POST", "/logout", &first).status, 303);
+    assert!(removed().is_empty(), "the allowed user is still signed in here (the third sign-in)");
+    assert_eq!(call(&demo, "POST", "/logout", &second).status, 303);
+    assert_eq!(removed(), vec![subject(DENIED)]);
+    assert_eq!(call(&demo, "POST", "/logout", &third).status, 303);
+    assert_eq!(removed(), vec![subject(DENIED), subject(ALLOWED)], "the allowed user's last sign-in ended");
 }
