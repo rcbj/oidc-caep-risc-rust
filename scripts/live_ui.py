@@ -66,12 +66,14 @@ def run_browser(env, out):
     names = {
         "UI_DEMO_ORIGIN": env["demoOrigin"], "UI_STS_ORIGIN": env["stsOrigin"], "UI_OUT": "/out",
         "UI_STS_SPKI": leaf_spki(env["caFile"]),
-        "UI_ALLOWED_USER": env["username"], "UI_DENIED_USER": env["deniedUser"],
+        "UI_ALLOWED_USER": live.PROFILE["test_user"], "UI_DENIED_USER": live.DENIED_USER,
     }
     child = os.environ.copy()
     child.update(names)
-    child["UI_ALLOWED_PASSWORD"] = env["password"]
-    child["UI_DENIED_PASSWORD"] = env["deniedPassword"]
+    # The passwords go only into the browser container's environment.
+    _secret, allowed_password, denied_password = live.credentials()
+    child["UI_ALLOWED_PASSWORD"] = allowed_password
+    child["UI_DENIED_PASSWORD"] = denied_password
     owner = f"{os.getuid()}:{os.getgid()}"
     command = ["docker", "run", "--rm", "--name", BROWSER_CONTAINER, "--network", "host",
                "-v", f"{live.ROOT / 'scripts'}:/ui:ro", "-v", f"{out}:/out"]
@@ -104,13 +106,21 @@ def main():
             browser, code = run_browser(env, out)
     finally:
         live.docker_rm(BROWSER_CONTAINER)
+    # An explicit summary of named fields, user names from constants: no
+    # credential reaches what is printed.
+    steps = [row for row in browser.get("steps") or [] if isinstance(row, dict)]
+    failed = [row for row in browser.get("failed") or [] if isinstance(row, dict)]
     result = {
         "ok": browser.get("ok") is True and code == 0,
         "pepMode": "local",
-        "users": {"allowed": {"user": env["username"], live.TEST_ATTRIBUTE: live.TEST_ATTRIBUTE_VALUE},
-                  "denied": {"user": env["deniedUser"], live.TEST_ATTRIBUTE: live.DENIED_VALUE}},
+        "users": {"allowed": {"user": live.PROFILE["test_user"], live.TEST_ATTRIBUTE: live.TEST_ATTRIBUTE_VALUE},
+                  "denied": {"user": live.DENIED_USER, live.TEST_ATTRIBUTE: live.DENIED_VALUE}},
         "screenshotsDir": str(out),
-        **{k: v for k, v in browser.items() if k != "ok"},
+        "checks": int(browser.get("checks") or 0),
+        "failed": [{"check": str(row.get("check")), "got": row.get("got") if isinstance(row.get("got"), (int, bool)) else str(row.get("got")),
+                    "want": row.get("want") if isinstance(row.get("want"), (int, bool)) else str(row.get("want"))} for row in failed],
+        "screenshots": [str(name) for name in browser.get("screenshots") or []],
+        "steps": [{"check": str(row.get("check")), "got": row.get("got") if isinstance(row.get("got"), (int, bool)) else str(row.get("got"))} for row in steps],
     }
     print(json.dumps(result, indent=2))
     if not result["ok"]:

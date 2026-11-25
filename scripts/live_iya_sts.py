@@ -723,7 +723,7 @@ def stored_policy(client, sts_origin, token, application):
     if out and document is not None:
         Path(out).write_text(document, encoding="utf-8")
         print(f"saved the stored XACML of {name}", flush=True)
-    return {"name": name, "stored": document is not None, "matchesUnitTable": same}
+    return {"name": str(name), "stored": document is not None, "matchesUnitTable": bool(same)}
 
 
 def pep_state(driver):
@@ -763,8 +763,8 @@ def pep_checks(driver, mode, denied=None):
         denied_status, denied_body = attribute_protected(denied)
         denied_read, _denied_read_body = order(denied, "GET")
         checks["attributeProtected"] = {
-            "allowedUser": {"user": driver.username, "status": allowed_status, "heading": heading(allowed_body)},
-            "deniedUser": {"user": denied.username, "status": denied_status, "heading": heading(denied_body)},
+            "allowedUser": {"user": PROFILE["test_user"], "status": allowed_status, "heading": heading(allowed_body)},
+            "deniedUser": {"user": DENIED_USER, "status": denied_status, "heading": heading(denied_body)},
         }
         checks["attributeIs200ForAllowedUser"] = allowed_status == 200
         checks["attributeIs403ForDeniedUser"] = denied_status == 403
@@ -973,9 +973,11 @@ def provisioned(pep=None, sts_container=None, demo_name=None, image=None, defaul
         start_demo(image, demo_name, demo_port, demo_origin, mounts)
         yield {
             "stsOrigin": sts_origin, "demoOrigin": demo_origin, "demoPort": demo_port, "demoName": demo_name,
-            "image": image, "mounts": mounts, "caFile": ca_file, "secret": secret, "clientId": client_id,
-            "username": username, "password": password, "deniedUser": DENIED_USER if pep else None,
-            "deniedPassword": denied_password if pep else None, "chainCount": chain_count, "work": work,
+            # No secret or password goes in here: what a run prints is built
+            # from this, and they stay in the environment (credentials()).
+            "image": image, "mounts": mounts, "caFile": ca_file, "clientId": client_id,
+            "username": username, "deniedUser": DENIED_USER if pep else None,
+            "chainCount": chain_count, "work": work,
             "pep": written.get("pep"), "client": client,
         }
     finally:
@@ -988,6 +990,14 @@ def provisioned(pep=None, sts_container=None, demo_name=None, image=None, defaul
             if sts_name:
                 docker_rm(sts_name)
         shutil.rmtree(work, ignore_errors=True)
+
+
+def credentials():
+    """The admin client secret and the two test users' passwords, which
+    provisioned() put in the environment. Read where they are used, so they
+    never travel with what a run reports."""
+    return (os.environ["ADMIN_API_CLIENT_SECRET"], os.environ[PROFILE["password_env"]],
+            os.environ.get(DENIED_PASSWORD_ENV, ""))
 
 
 def sts_name_for(name):
@@ -1007,14 +1017,15 @@ def main():
     pep = "--pep" in sys.argv[1:] or os.environ.get("LIVE_PEP", "") in ("1", "true", "yes")
     with provisioned(pep="central" if pep else None) as env:
         sts_origin, demo_origin, ca_file = env["stsOrigin"], env["demoOrigin"], env["caFile"]
-        username, password, secret, client_id = env["username"], env["password"], env["secret"], env["clientId"]
+        username, client_id = PROFILE["test_user"], env["clientId"]
+        secret, password, denied_password = credentials()
         client = env["client"]
         pep_result = {}
         if pep:
-            pep_result["application"] = client_id
-            pep_result["name"] = env["pep"]["name"]
-            pep_result["users"] = {"allowed": {"user": username, TEST_ATTRIBUTE: TEST_ATTRIBUTE_VALUE},
-                                   "denied": {"user": env["deniedUser"], TEST_ATTRIBUTE: DENIED_VALUE}}
+            pep_result["application"] = str(client_id)
+            pep_result["name"] = PEP_NAME
+            pep_result["users"] = {"allowed": {"user": PROFILE["test_user"], TEST_ATTRIBUTE: TEST_ATTRIBUTE_VALUE},
+                                   "denied": {"user": DENIED_USER, TEST_ATTRIBUTE: DENIED_VALUE}}
             pep_result["storedPolicy"] = stored_policy(client, sts_origin, mint_admin(client, sts_origin, secret), client_id)
         driver = Driver(client, sts_origin, demo_origin, username, password)
         driver.sign_in()
@@ -1025,7 +1036,7 @@ def main():
         )
         print(f"signed in as {signed_in.get('subject')}; {signed_in.get('receiver')}", flush=True)
         if pep:
-            denied = Driver(Client(ca_file), sts_origin, demo_origin, env["deniedUser"], env["deniedPassword"])
+            denied = Driver(Client(ca_file), sts_origin, demo_origin, DENIED_USER, denied_password)
             denied.sign_in()
             central = pep_checks(driver, "central", denied)
         token = mint_admin(client, sts_origin, secret)
@@ -1046,11 +1057,12 @@ def main():
             ),
             "session-revoked to end the local session",
         )
+        # Only named fields, each a plain value: no credential reaches it.
         result = {
             "ok": True,
-            "subject": signed_in.get("subject"),
-            "tlsCaInImage": env["chainCount"],
-            "events": finished.get("events"),
+            "subject": str(signed_in.get("subject") or ""),
+            "tlsCaInImage": int(env["chainCount"]),
+            "events": [{"type": str(item.get("type") or ""), "jti": str(item.get("jti") or "")} for item in finished.get("events") or []],
         }
         if pep:
             pep_result["central"] = central
@@ -1061,7 +1073,7 @@ def main():
             local_driver.sign_in()
             wait_for(local_driver, lambda row: row.get("signedIn") is True and "polling" in str(row.get("receiver") or ""),
                      "a signed-in local-mode demo polling its stream")
-            local_denied = Driver(Client(ca_file), sts_origin, demo_origin, env["deniedUser"], env["deniedPassword"])
+            local_denied = Driver(Client(ca_file), sts_origin, demo_origin, DENIED_USER, denied_password)
             local_denied.sign_in()
             local = pep_checks(local_driver, "local", local_denied)
             token = mint_admin(client, sts_origin, secret)
