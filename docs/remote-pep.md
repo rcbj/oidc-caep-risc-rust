@@ -119,7 +119,7 @@ oidc-caep-risc = { version = "…", features = ["pep"] }    # central
 oidc-caep-risc = { version = "…", features = ["local"] }  # local (includes central)
 ```
 
-Without the feature a `pep` section is refused when the configuration is read, rather than silently ignored.
+Without the feature a `pep` section is refused when the configuration is read, rather than silently ignored. A section that names no `mode` is `local`, so a build with `pep` alone must name `"mode": "central"`; otherwise it is refused the same way.
 
 ## Configure
 
@@ -167,7 +167,7 @@ let access = Access::new("read", "order", order_id);
 match rp.decide_session(&session_id, &access) {
     Decision::Permit { obligations, .. } => serve(obligations),
     Decision::Deny { why } => forbidden(&why),          // 403
-    Decision::Unavailable { why } => unavailable(&why), // 503: fail closed
+    Decision::Unavailable { why } => forbidden(&why),   // 403: fail closed
 }
 // Or with a Login you hold yourself: rp.decide(&login, &access)
 ```
@@ -231,7 +231,7 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 
 ## The demo
 
-Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/oidc.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
+Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/oidc.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, and 403 on a Deny and on `Unavailable` (any PEP failure is a 403: the page says the PEP could not decide).
 
 Set it up in one command:
 

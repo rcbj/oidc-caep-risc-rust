@@ -576,7 +576,9 @@ fn route(app: Arc<App>, request: Request) {
 /// A route the embedded PEP protects (the `pep` feature, iya-sts#1206): the
 /// signed-in person's access to one order, decided by the `pep` section's
 /// PEP. A GET is `read` and anything else `write`. No sign-in is 401, a
-/// Deny 403, and a decision that couldn't be made 503: never served.
+/// Deny 403, and any other PEP failure 403 too (no decision, or no relying
+/// party to ask): an enforcement point that cannot say yes says no, and the
+/// page says which. Never served.
 #[cfg(feature = "pep")]
 fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
     use oidc_caep_risc::pep::{Access, Decision};
@@ -586,7 +588,7 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
     };
     let (rp, _) = relying_party(app);
     let Some(rp) = rp else {
-        respond(request, 503, "text/html; charset=utf-8", &page("Unavailable", "<h1>The relying party is not configured</h1>"), &[]);
+        respond(request, 403, "text/html; charset=utf-8", &page_for("Forbidden", "<h1>Not allowed</h1><p class=\"problem\">No decision could be asked for: the relying party is not configured.</p>", Some(&session.login)), &[]);
         return;
     };
     let action = if *method == Method::Get { "read" } else { "write" };
@@ -602,7 +604,7 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
         }
         Decision::Unavailable { why } => {
             let body = format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why));
-            respond(request, 503, "text/html; charset=utf-8", &page_for("Unavailable", &body, Some(&session.login)), &[]);
+            respond(request, 403, "text/html; charset=utf-8", &page_for("Forbidden", &body, Some(&session.login)), &[]);
         }
     }
 }
@@ -612,7 +614,8 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
 /// to a person whose directory attribute attr1 is abc123. The value is not
 /// in the ID token: the PEP asks iya-sts's PIP for it (`POST /xacml/pip`),
 /// in `local` mode as in `central`. 401 without a sign-in, 200 on a Permit,
-/// 403 on a Deny, 503 on no decision.
+/// 403 on a Deny and on any other PEP failure (no decision, or no relying
+/// party to ask), the page saying which.
 #[cfg(feature = "pep")]
 fn attribute_protected(app: &Arc<App>, request: Request) {
     use oidc_caep_risc::pep::{Access, Decision};
@@ -622,14 +625,14 @@ fn attribute_protected(app: &Arc<App>, request: Request) {
     };
     let (rp, _) = relying_party(app);
     let Some(rp) = rp else {
-        respond(request, 503, "text/html; charset=utf-8", &page("Unavailable", "<h1>The relying party is not configured</h1>"), &[]);
+        respond(request, 403, "text/html; charset=utf-8", &page_for("Forbidden", "<h1>Not allowed</h1><p class=\"problem\">No decision could be asked for: the relying party is not configured.</p>", Some(&session.login)), &[]);
         return;
     };
     let what = "<p><small>The demo application's policy permits <code>read</code> on <code>attribute-protected</code> when your directory attribute <code>attr1</code> is <code>abc123</code>. The PEP asked iya-sts's PIP for it: it is not in your ID token.</small></p>";
     let (status, title, body) = match rp.decide(&session.login, &Access::new("read", "attribute-protected", "attr1")) {
         Decision::Permit { .. } => (200, "Attribute-protected", format!("<h1>Allowed</h1><p class=\"notice\">The PEP permitted it: your <code>attr1</code> is <code>abc123</code>.</p>{what}")),
         Decision::Deny { why } => (403, "Forbidden", format!("<h1>Not allowed</h1><p class=\"problem\">The PEP denied it: {}</p>{what}", esc(&why))),
-        Decision::Unavailable { why } => (503, "Unavailable", format!("<h1>No decision</h1><p class=\"problem\">The PEP could not decide: {}</p>{what}", esc(&why))),
+        Decision::Unavailable { why } => (403, "Forbidden", format!("<h1>No decision</h1><p class=\"problem\">The PEP could not decide: {}</p>{what}", esc(&why))),
     };
     respond(request, status, "text/html; charset=utf-8", &page_for(title, &body, Some(&session.login)), &[]);
 }
