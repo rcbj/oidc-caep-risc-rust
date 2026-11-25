@@ -530,6 +530,11 @@ fn route(app: Arc<App>, request: Request) {
         return;
     }
     #[cfg(feature = "pep")]
+    if path == "/attribute-protected" {
+        attribute_protected(&app, request);
+        return;
+    }
+    #[cfg(feature = "pep")]
     if let Some(id) = path.strip_prefix("/orders/").filter(|id| !id.is_empty() && !id.contains('/')) {
         let id = id.to_string();
         order(&app, request, &method, &id);
@@ -570,6 +575,33 @@ fn order(app: &Arc<App>, request: Request, method: &Method, id: &str) {
             respond(request, 503, "text/html; charset=utf-8", &page_for("Unavailable", &body, Some(&session.login)), &[]);
         }
     }
+}
+
+/// `GET /attribute-protected`: decided by the embedded PEP against the demo
+/// application's own (fine-grained authorization) policy, which permits it
+/// to a person whose directory attribute attr1 is abc123. The value is not
+/// in the ID token: the PEP asks iya-sts's PIP for it (`POST /xacml/pip`),
+/// in `local` mode as in `central`. 401 without a sign-in, 200 on a Permit,
+/// 403 on a Deny, 503 on no decision.
+#[cfg(feature = "pep")]
+fn attribute_protected(app: &Arc<App>, request: Request) {
+    use oidc_caep_risc::pep::{Access, Decision};
+    let Some(session) = session_of(app, &request) else {
+        respond(request, 401, "text/html; charset=utf-8", &page("Sign in", "<h1>Sign in first</h1><p><a href=\"/login\">Sign in</a></p>"), &[]);
+        return;
+    };
+    let (rp, _) = relying_party(app);
+    let Some(rp) = rp else {
+        respond(request, 503, "text/html; charset=utf-8", &page("Unavailable", "<h1>The relying party is not configured</h1>"), &[]);
+        return;
+    };
+    let what = "<p><small>The demo application's policy permits <code>read</code> on <code>attribute-protected</code> when your directory attribute <code>attr1</code> is <code>abc123</code>. The PEP asked iya-sts's PIP for it: it is not in your ID token.</small></p>";
+    let (status, title, body) = match rp.decide(&session.login, &Access::new("read", "attribute-protected", "attr1")) {
+        Decision::Permit { .. } => (200, "Attribute-protected", format!("<h1>Allowed</h1><p class=\"notice\">The PEP permitted it: your <code>attr1</code> is <code>abc123</code>.</p>{what}")),
+        Decision::Deny { why } => (403, "Forbidden", format!("<h1>Not allowed</h1><p class=\"problem\">The PEP denied it: {}</p>{what}", esc(&why))),
+        Decision::Unavailable { why } => (503, "Unavailable", format!("<h1>No decision</h1><p class=\"problem\">The PEP could not decide: {}</p>{what}", esc(&why))),
+    };
+    respond(request, status, "text/html; charset=utf-8", &page_for(title, &body, Some(&session.login)), &[]);
 }
 
 fn home(app: &Arc<App>, request: Request) {
@@ -1244,6 +1276,10 @@ fn pep_fragment(rp: Option<&Arc<RelyingParty>>) -> String {
         }
         out.push_str("</table></details>");
     }
+    out.push_str("<details class=\"card pane\" id=\"pep-try\" open><summary><h2>Try it</h2></summary><ul class=\"checks\">\
+<li><a href=\"/orders/42\">/orders/42</a> <span class=\"muted\">read an order: permitted when your sign-in carried an acr</span></li>\
+<li><a href=\"/attribute-protected\">/attribute-protected</a> <span class=\"muted\">permitted when your directory attribute attr1 is abc123, which the PEP asks iya-sts's PIP for</span></li>\
+</ul><p><small>Each is decided by this PEP against the demo application's own policy; the counters above move as you try them.</small></p></details>");
     out.push_str("<p><small>Refreshed every 2 seconds. <a href=\"/pep-status\">As JSON</a>.</small></p>");
     out
 }
@@ -1534,6 +1570,7 @@ mod tests {
         assert!(html.contains("class=\"problem\""), "iya-sts is unreachable, and the page says so");
         assert!(html.contains("Permit cache"), "central mode shows the cache");
         assert!(!html.contains("<script"), "the fragment carries no script");
+        assert!(html.contains("href=\"/attribute-protected\"") && html.contains("id=\"pep-try\""), "the Try it pane links the two protected pages");
         for id in ["pep-decisions", "pep-cached-policy", "pep-the-pep", "pep-control-plane"] {
             assert!(html.contains(&format!("<details class=\"card pane\" id=\"{id}\" open>")), "{id}: open by default, with the id pep.js keeps it closed by");
         }
