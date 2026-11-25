@@ -24,6 +24,8 @@ async function refresh() {
         const pane = document.getElementById(id);
         if (pane) pane.open = false;
       }
+      // The Collapse all / Expand all toggle reads the panes again.
+      document.dispatchEvent(new Event('panes-redrawn'));
     }
   } catch (err) {
     // The demo restarting: keep what is shown and try again on the next tick.

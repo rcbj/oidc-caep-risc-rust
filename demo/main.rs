@@ -463,6 +463,11 @@ fn route(app: Arc<App>, request: Request) {
         respond(request, 200, "text/javascript; charset=utf-8", raw, &[]);
         return;
     }
+    if path == "/panes.js" && method == Method::Get {
+        let raw = include_str!("public/panes.js");
+        respond(request, 200, "text/javascript; charset=utf-8", raw, &[]);
+        return;
+    }
     if path == "/menu.js" && method == Method::Get {
         let raw = include_str!("public/menu.js");
         respond(request, 200, "text/javascript; charset=utf-8", raw, &[]);
@@ -590,8 +595,11 @@ fn home(app: &Arc<App>, request: Request) {
         };
         let events = app.events.lock().unwrap().clone();
         let last_id = events.last().map(|e| e.id).unwrap_or(0);
+        // The Session and Policy enforcement tabs' panes are collapsible; one
+        // toggle opens or closes every pane on the tab (panes.js shows it).
+        let toggle = "<p class=\"pane-tools\"><button type=\"button\" class=\"secondary small\" id=\"panes-toggle\" hidden>Collapse all</button></p>";
         let content = match tab.as_str() {
-            "pep" => format!("<div id=\"pep-panel\" aria-live=\"polite\">{}</div><script src=\"/pep.js\" defer></script>", pep_fragment(rp.as_ref())),
+            "pep" => format!("{toggle}{}", format!("<div id=\"pep-panel\" aria-live=\"polite\">{}</div><script src=\"/pep.js\" defer></script>", pep_fragment(rp.as_ref()))),
             "events" => {
                 let notice = match query_param(request.url(), "verify").as_str() {
                     "sent" => "A verification event was requested; it appears below when the transmitter sends it.",
@@ -600,7 +608,7 @@ fn home(app: &Arc<App>, request: Request) {
                 };
                 events_panel(&events, &app.state.lock().unwrap(), notice)
             }
-            _ => session_body,
+            _ => format!("{toggle}{session_body}"),
         };
         let tab_link = |id: &str, href: &str, label: &str| {
             let on = id == tab;
@@ -608,7 +616,7 @@ fn home(app: &Arc<App>, request: Request) {
         };
         let count = if events.is_empty() { String::new() } else { events.len().to_string() };
         let body = format!(
-            "<h1>Signed in as {}</h1><nav class=\"page-tabs\" role=\"tablist\" aria-label=\"Sections\">{}{}{}</nav><p id=\"signal-banner\" class=\"problem\" hidden></p><p id=\"signal-toast\" class=\"notice\" hidden></p><div role=\"tabpanel\" id=\"panel\" data-base=\"\" data-tab=\"{}\" data-last-id=\"{last_id}\">{content}</div><script src=\"/app.js\" defer></script>",
+            "<h1>Signed in as {}</h1><nav class=\"page-tabs\" role=\"tablist\" aria-label=\"Sections\">{}{}{}</nav><p id=\"signal-banner\" class=\"problem\" hidden></p><p id=\"signal-toast\" class=\"notice\" hidden></p><div role=\"tabpanel\" id=\"panel\" data-base=\"\" data-tab=\"{}\" data-last-id=\"{last_id}\">{content}</div><script src=\"/app.js\" defer></script><script src=\"/panes.js\" defer></script>",
             esc(&who),
             tab_link("session", "/", "Session"),
             tab_link("events", "/?tab=events", &format!("CAEP &amp; RISC events <span class=\"count\" id=\"signal-count\">{count}</span>")),
@@ -1439,6 +1447,15 @@ mod tests {
         assert_eq!(display_name(&preferred), "bob", "preferred_username when there is no username claim");
         let neither = Login { subject: "urn:uuid:2".into(), ..Default::default() };
         assert_eq!(display_name(&neither), "urn:uuid:2", "the subject only when nothing else names them");
+    }
+
+    #[test]
+    fn the_panes_toggle_ships_hidden_and_its_script_is_served() {
+        let script = include_str!("public/panes.js");
+        assert!(script.contains("panes-toggle") && script.contains("Expand all") && script.contains("panes-redrawn"));
+        assert!(include_str!("public/pep.js").contains("panes-redrawn"), "pep.js tells the toggle when it redrew");
+        let src = include_str!("main.rs");
+        assert!(src.contains("id=\\\"panes-toggle\\\" hidden>Collapse all"), "hidden until the script shows it");
     }
 
     #[test]

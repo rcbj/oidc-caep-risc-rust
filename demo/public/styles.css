@@ -91,3 +91,5 @@ header.topbar { display: flex; align-items: center; justify-content: space-betwe
 .menu-sep { height: 1px; background: var(--line); margin: 0.3rem 0.2rem; }
 .acct-menu form { margin: 0; }
 .small { font-size: 0.8rem; }
+.pane-tools { display: flex; justify-content: flex-end; margin: 0 0 0.5rem; }
+button.small { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
