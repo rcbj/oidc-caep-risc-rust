@@ -1,0 +1,141 @@
+{
+  "about": [
+    "The demo application's own policy, as scripts/configure_iya_sts.py --pep installs it (orders_policy()), for src/demo_pep_test.rs.",
+    "alfa is orders_policy()'s text; xacml is the document iya-sts stores for it, which the offline stub PDP serves to the demo's local PEP.",
+    "scripts/live_iya_sts.py --pep compares xacml with what a fresh iya-sts stored (pep.storedPolicy.matchesUnitTable); LIVE_PEP_XACML_OUT=<file> saves that document.",
+    "users are what iya-sts's PIP answers (POST /xacml/pip) for each username: attr1 by its AttributeId."
+  ],
+  "applications": {
+    "demo": {
+      "identifier": "oidc-caep-risc-demo",
+      "fga": true
+    }
+  },
+  "catalogue": [
+    {
+      "object": "subject",
+      "property": "acr",
+      "attributeId": "urn:example:acr"
+    }
+  ],
+  "policies": [
+    {
+      "name": "oidc-caep-risc-demo-fga",
+      "app": "demo",
+      "root": true,
+      "owned": true,
+      "alfa": [
+        "namespace pepdemo {",
+        "    attribute act { category = actionCat",
+        "        id = \"urn:oasis:names:tc:xacml:1.0:action:action-id\" type = string }",
+        "    attribute rtype { category = resourceCat",
+        "        id = \"urn:sts:xacml:authzen:resource-type\" type = string }",
+        "    attribute acr { category = subjectCat id = \"urn:example:acr\" type = string }",
+        "    attribute attr1 { category = subjectCat id = \"urn:sts:xacml:attribute:attr1\" type = string }",
+        "    policy pepdemoOrders {",
+        "        id = \"urn:example:pepdemo-orders\"",
+        "        apply firstApplicable",
+        "        rule readOrder {",
+        "            permit",
+        "            target clause act == \"read\"",
+        "            target clause rtype == \"order\"",
+        "            condition integerGreaterThan(stringBagSize(acr), 0)",
+        "        }",
+        "        rule readAttributeProtected {",
+        "            permit",
+        "            target clause act == \"read\"",
+        "            target clause rtype == \"attribute-protected\"",
+        "            target clause attr1 == \"abc123\"",
+        "        }",
+        "        rule otherwise {",
+        "            deny",
+        "        }",
+        "    }",
+        "}"
+      ],
+      "xacml": [
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<Policy xmlns=\"urn:oasis:names:tc:xacml:3.0:core:schema:wd-17\" PolicyId=\"urn:example:pepdemo-orders\" Version=\"1.0\" RuleCombiningAlgId=\"urn:oasis:names:tc:xacml:1.0:rule-combining-algorithm:first-applicable\">",
+        "  <Target/>",
+        "  <Rule RuleId=\"readOrder\" Effect=\"Permit\">",
+        "    <Target>",
+        "      <AnyOf>",
+        "        <AllOf>",
+        "          <Match MatchId=\"urn:oasis:names:tc:xacml:1.0:function:string-equal\">",
+        "            <AttributeValue DataType=\"http://www.w3.org/2001/XMLSchema#string\">read</AttributeValue>",
+        "            <AttributeDesignator Category=\"urn:oasis:names:tc:xacml:3.0:attribute-category:action\" AttributeId=\"urn:oasis:names:tc:xacml:1.0:action:action-id\" DataType=\"http://www.w3.org/2001/XMLSchema#string\" MustBePresent=\"false\"/>",
+        "          </Match>",
+        "        </AllOf>",
+        "      </AnyOf>",
+        "      <AnyOf>",
+        "        <AllOf>",
+        "          <Match MatchId=\"urn:oasis:names:tc:xacml:1.0:function:string-equal\">",
+        "            <AttributeValue DataType=\"http://www.w3.org/2001/XMLSchema#string\">order</AttributeValue>",
+        "            <AttributeDesignator Category=\"urn:oasis:names:tc:xacml:3.0:attribute-category:resource\" AttributeId=\"urn:sts:xacml:authzen:resource-type\" DataType=\"http://www.w3.org/2001/XMLSchema#string\" MustBePresent=\"false\"/>",
+        "          </Match>",
+        "        </AllOf>",
+        "      </AnyOf>",
+        "    </Target>",
+        "    <Condition>",
+        "      <Apply FunctionId=\"urn:oasis:names:tc:xacml:1.0:function:integer-greater-than\">",
+        "        <Apply FunctionId=\"urn:oasis:names:tc:xacml:1.0:function:string-bag-size\">",
+        "          <AttributeDesignator Category=\"urn:oasis:names:tc:xacml:1.0:subject-category:access-subject\" AttributeId=\"urn:example:acr\" DataType=\"http://www.w3.org/2001/XMLSchema#string\" MustBePresent=\"false\"/>",
+        "        </Apply>",
+        "        <AttributeValue DataType=\"http://www.w3.org/2001/XMLSchema#integer\">0</AttributeValue>",
+        "      </Apply>",
+        "    </Condition>",
+        "  </Rule>",
+        "  <Rule RuleId=\"readAttributeProtected\" Effect=\"Permit\">",
+        "    <Target>",
+        "      <AnyOf>",
+        "        <AllOf>",
+        "          <Match MatchId=\"urn:oasis:names:tc:xacml:1.0:function:string-equal\">",
+        "            <AttributeValue DataType=\"http://www.w3.org/2001/XMLSchema#string\">read</AttributeValue>",
+        "            <AttributeDesignator Category=\"urn:oasis:names:tc:xacml:3.0:attribute-category:action\" AttributeId=\"urn:oasis:names:tc:xacml:1.0:action:action-id\" DataType=\"http://www.w3.org/2001/XMLSchema#string\" MustBePresent=\"false\"/>",
+        "          </Match>",
+        "        </AllOf>",
+        "      </AnyOf>",
+        "      <AnyOf>",
+        "        <AllOf>",
+        "          <Match MatchId=\"urn:oasis:names:tc:xacml:1.0:function:string-equal\">",
+        "            <AttributeValue DataType=\"http://www.w3.org/2001/XMLSchema#string\">attribute-protected</AttributeValue>",
+        "            <AttributeDesignator Category=\"urn:oasis:names:tc:xacml:3.0:attribute-category:resource\" AttributeId=\"urn:sts:xacml:authzen:resource-type\" DataType=\"http://www.w3.org/2001/XMLSchema#string\" MustBePresent=\"false\"/>",
+        "          </Match>",
+        "        </AllOf>",
+        "      </AnyOf>",
+        "      <AnyOf>",
+        "        <AllOf>",
+        "          <Match MatchId=\"urn:oasis:names:tc:xacml:1.0:function:string-equal\">",
+        "            <AttributeValue DataType=\"http://www.w3.org/2001/XMLSchema#string\">abc123</AttributeValue>",
+        "            <AttributeDesignator Category=\"urn:oasis:names:tc:xacml:1.0:subject-category:access-subject\" AttributeId=\"urn:sts:xacml:attribute:attr1\" DataType=\"http://www.w3.org/2001/XMLSchema#string\" MustBePresent=\"false\"/>",
+        "          </Match>",
+        "        </AllOf>",
+        "      </AnyOf>",
+        "    </Target>",
+        "  </Rule>",
+        "  <Rule RuleId=\"otherwise\" Effect=\"Deny\">",
+        "    <Target/>",
+        "  </Rule>",
+        "</Policy>"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "oidc-demo-user",
+      "attributes": {
+        "urn:sts:xacml:attribute:attr1": "abc123"
+      }
+    },
+    {
+      "username": "oidc-demo-denied",
+      "attributes": {
+        "urn:sts:xacml:attribute:attr1": "not-abc123"
+      }
+    },
+    {
+      "username": "oidc-demo-no-attr1",
+      "attributes": {}
+    }
+  ]
+}

@@ -206,12 +206,14 @@ fn policy_rows(table: &Value, app: &str) -> Vec<Value> {
         .collect()
 }
 
-struct Pdp {
-    url: String,
-    pip_queries: Mutex<usize>,
+/// Also the stub `src/demo_pep_test.rs` drives the demo's PEP routes
+/// against, with its own table (`src/tests/demo_pep_policy.json`).
+pub(crate) struct Pdp {
+    pub(crate) url: String,
+    pub(crate) pip_queries: Mutex<usize>,
 }
 
-fn start_pdp(table: &'static Value) -> &'static Pdp {
+pub(crate) fn start_pdp(table: &'static Value) -> &'static Pdp {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let pdp: &'static Pdp = Box::leak(Box::new(Pdp { url: format!("http://127.0.0.1:{port}"), pip_queries: Mutex::new(0) }));
@@ -256,7 +258,7 @@ fn answer(pdp: &Pdp, table: &Value, req: &Req) -> (u16, Vec<(String, String)>, V
     }
 }
 
-fn key_file(tag: &str, seed: u8) -> String {
+pub(crate) fn key_file(tag: &str, seed: u8) -> String {
     use p256::pkcs8::EncodePrivateKey;
     let pem = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap().to_pkcs8_pem(Default::default()).unwrap().to_string();
     let path = std::env::temp_dir().join(format!("oidc-authzen-{tag}-{}.pem", std::process::id()));
